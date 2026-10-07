@@ -2,9 +2,9 @@
 
 Token-efficient Reddit intelligence CLI, built for LLM agents.
 
-Fetches Reddit discussions through free community archives — no API key, no
-account, no cost — and compresses them **before** they reach the agent's
-context (~40:1 token saving vs raw JSON).
+Fetches Reddit discussions through the [Arctic Shift](https://arctic-shift.photon-reddit.com)
+archive — no API key, no account, no cost — and compresses them **before** they
+reach the agent's context.
 
 ## Install
 
@@ -18,14 +18,22 @@ Requirements: Python 3.10+, standard library only. No dependencies.
 
 ## Usage
 
+`--subs` is required. Arctic Shift returns an empty 200 for `subreddit=all` and
+400 for a full-text query with no subreddit, so a missing subreddit is a usage
+error (exit 1), not an empty digest.
+
 ```bash
-# Search posts (compact table by default)
+# Search posts in a real time window (compact table)
 ./bin/reddit-intel search "1.6T optical" --subs semiconductors,hardware --since 7d
+
+# Recent posts ranked by live comments/hour (archive scores are stale for ~36h)
+./bin/reddit-intel hot --subs stocks --since 24h --limit 10
+./bin/reddit-intel search "earnings" --subs stocks --since 24h --engagement
 
 # Top comments of a post
 ./bin/reddit-intel comments 1wwfn3n --top 20
 
-# Briefing prep for a time window (agent writes the actual summary)
+# Briefing prep for a time window (the agent writes the summary)
 ./bin/reddit-intel digest "AI datacenter" --subs stocks --since 24h --limit 15
 ```
 
@@ -33,55 +41,103 @@ Requirements: Python 3.10+, standard library only. No dependencies.
 
 | Flag | Description | Default |
 |---|---|---|
-| `--subs a,b,c` | subreddits to search | `all` |
-| `--since` | `24h`, `7d`, `30d` or `YYYY-MM-DD` | `7d` |
+| `--subs a,b` | subreddits to search; **required**. `all` is rejected | none |
+| `--since` | `24h`, `7d`, `30d`, or `YYYY-MM-DD` (UTC) | `7d` (`36h` for `hot`) |
 | `--limit N` | max posts returned | `10` |
-| `--min-score N` | minimum post score (search) | `0` |
-| `--excerpt-chars N` | excerpt length | `200` |
+| `--min-score N` | minimum score for posts older than 36h | `0` |
+| `--excerpt-chars N` | excerpt length (search, digest, hot) | `200` |
 | `--format` | `compact` (markdown table) or `json` | `compact` |
-| `--backend` | `auto`, `arctic-shift`, `pullpush` | `auto` |
+| `--backend` | `auto`, `arctic-shift`, or `pullpush` | `auto` |
+| `--engagement` | live comment counts for posts younger than 36h | off (`hot` turns it on) |
+| `--engagement-top N` | how many young posts to measure (max 12) | `8` (`10` for `hot`) |
+
+`search` takes a query (`""` browses the window). `hot` takes an optional query.
+Multi-word queries match every term (quoted phrases stay one term). The Arctic
+Shift `query` parameter is sent through unchanged; if that index errors or
+returns nothing, one browse of the same window is filtered the same way.
+
+### Score pending and live engagement
+
+Arctic Shift ingests a post at creation time. `score` and `num_comments` are
+backfilled about **36 hours** later, so younger posts usually show score 1 and
+0 comments. The compact table prints `pending` instead of that snapshot.
+`num_comments` on those rows is `?` until it is measured.
+
+`--engagement` and `hot` then:
+
+1. take up to N young posts (spread across the window, not only the last minutes)
+2. count comments with `/api/comments/search?link_id=` (`fields=id,created_utc`, no bodies)
+3. rank those posts by comments per hour (age floored at 15 minutes)
+4. rank posts older than 36h by gravity on the real score: `score / (age_hours + 2) ^ 1.5`
+
+Counts above 300 are a lower bound (`300+`). Results are cached for 15 minutes
+under `$XDG_CACHE_HOME/reddit-intel/engagement.json` (or `~/.cache/...`).
+Set `REDDIT_INTEL_CACHE=off` to disable the file. Requests stay at about 1/s,
+and comment-count requests at about 1 per 1.5s.
+
+### How the time window works
+
+`--since` is sent as Arctic Shift `after`. Pages of 100 walk backward with an
+exclusive `before` cursor until the window starts, a short page comes back, or
+**1000 posts per subreddit**. A truncated window is called out in the output;
+narrow `--since` or `--subs` to finish it. Ranking happens after that scan,
+not on the newest handful of rows.
 
 ## How token saving works
 
-1. **Field allowlist** — 8 fields kept (`id`, `title`, `subreddit`, `score`,
-   `num_comments`, `created`, `url`, `excerpt`), 30+ dropped
-2. **Excerpt truncation** — body cut at word boundary, not mid-word
-3. **Server-side ranking** — gravity score (`score / (age_hours + 2)^1.5`),
-   top N only
-4. **Compact rendering** — markdown table instead of repeated-key JSON
-5. **Progressive depth** — `search` → `comments` → `digest`; drill down only
-   as needed
+1. **Field allowlist** — `id`, `title`, `subreddit`, `score`, `score_status`,
+   `num_comments`, `created`, `url`, `excerpt`. Live rows also carry
+   `comments_per_hour` and `comments_source`. A removed body sets `removed`
+   and an empty excerpt.
+2. **Excerpt truncation** — body cut at a word boundary (`--excerpt-chars`)
+3. **Ranking** — gravity for backfilled posts; comments/hour when `--engagement`
+   measured a young post. Top N only.
+4. **Compact rendering** — markdown table, ASCII headers (safe on GBK consoles)
+5. **Progressive depth** — `search` / `hot` → `comments` → `digest`
 
-The CLI never calls an LLM. Semantic work (clustering, sentiment, summaries)
-belongs to the calling agent — the tool's job is to turn 50k tokens of raw
-data into 1k tokens of prepared material.
+The CLI never calls an LLM.
 
 ## Data sources
 
 | Backend | Role | Auth |
 |---|---|---|
-| [Arctic Shift](https://arctic-shift.photon-reddit.com) | primary | none |
-| [PullPush](https://api.pullpush.io) | fallback | none |
+| [Arctic Shift](https://arctic-shift.photon-reddit.com) | only automatic source | none |
+| [PullPush](https://api.pullpush.io) | explicit `--backend pullpush` only | none |
 
-Three-level search fallback: Arctic Shift full-text → PullPush full-text →
-Arctic Shift browse + client-side keyword filter. Transient failures are
-retried with backoff. Both are volunteer-run archives; ~1 req/sec pacing is
-enforced — please be polite.
+`auto` does not call PullPush. PullPush responds to agent clients with a
+refusal (429 "does not provide free scraping resources for agents", or a 403
+HTML block) and that response is not retried.
+
+Full-text search failures, and queries that return zero rows, fall back **once**
+to an Arctic Shift browse of the same window plus a client-side term filter.
+
+HTTP 429 waits for `X-RateLimit-Reset` (capped at 45s). HTTP 400/404 fail
+immediately. HTTP 422 timeouts and 5xx use jittered backoff. Nothing sleeps
+after the attempt that gives up. Please stay polite; these are volunteer archives.
 
 ## Exit codes
 
-- `0` — ok
-- `1` — usage error (bad flags)
-- `2` — all backends failed
+- `0` — ok, including a real empty window
+- `1` — usage error (missing `--subs`, bad flags, argparse errors)
+- `2` — the backend failed
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
 
 ## Limits
 
-- Archive data lags live Reddit (~1 hour); not for second-level monitoring
-- Public posts and comments only (no auth endpoints)
+- Post scores and stored comment counts lag ~36 hours. Comment text is much
+  closer to live. Not a second-level monitor.
+- At most 1000 posts are scanned per subreddit per command. Busy subs over a
+  long `--since` need a narrower window.
+- Public posts and comments only.
 
 ## For agents
 
-See [SKILL.md](SKILL.md) for the agent-facing usage guide.
+See [SKILL.md](SKILL.md).
 
 ## License
 
