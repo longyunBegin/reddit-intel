@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""
+reddit-intel: token-efficient Reddit intelligence CLI, built for LLM agents.
+
+Fetches Reddit discussions through free community archives (no API key needed)
+and compresses them *before* they reach the agent's context:
+
+  1. field allowlist   - keep 8 fields, drop 30+ noise fields        (~60% cut)
+  2. excerpt truncate  - body cut at word boundary, default 200 chars
+  3. server-side rank  - score x time-decay, return top N only
+  4. compact render    - markdown table instead of repeated-key JSON (~35% cut)
+  5. progressive depth - search -> comments -> digest, agent drills as needed
+
+Typical saving: 100 raw posts (~50k tokens) -> 10 compact rows (~1k tokens).
+
+Backends (auto-fallback):
+  - Arctic Shift  https://arctic-shift.photon-reddit.com  (primary)
+  - PullPush      https://api.pullpush.io                  (fallback)
+
+Exit codes: 0 ok, 1 usage error, 2 all backends failed. Never prompts.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+USER_AGENT = f"reddit-intel/{VERSION} (token-efficient agent tool; contact: github.com/longyunBegin/reddit-intel)"
+REQUEST_TIMEOUT = 25
+PACE_SECONDS = 1.0  # be polite to volunteer-run archives
+
+ARCTIC_BASE = "https://arctic-shift.photon-reddit.com"
+PULLPUSH_BASE = "https://api.pullpush.io"
+
+_last_request_ts = 0.0
+
+
+# --------------------------------------------------------------------------
+# HTTP helper
+# --------------------------------------------------------------------------
+
+class BackendError(Exception):
+    pass
+
+
+def fetch_json(url: str, retries: int = 3) -> dict | list:
+    """GET url, return parsed JSON. Retries transient failures with backoff.
+
+    Arctic Shift / PullPush are volunteer-run; 422/429/5xx flakes are common.
+    Raises BackendError only after retries are exhausted.
+    """
+    global _last_request_ts
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        wait = PACE_SECONDS - (time.monotonic() - _last_request_ts)
+        if wait > 0:
+            time.sleep(wait)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                if resp.status != 200:
+                    raise BackendError(f"HTTP {resp.status} for {url}")
+                _last_request_ts = time.monotonic()
+                return json.loads(resp.read().decode("utf-8"))
+        except BackendError as e:
+            last_err = e
+        except Exception as e:  # network, timeout, bad JSON
+            last_err = BackendError(f"{type(e).__name__}: {e} for {url}")
+        time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff before retry
+    raise last_err if isinstance(last_err, BackendError) else BackendError(str(last_err))
+
+
+# --------------------------------------------------------------------------
+# Normalization: raw post -> 8-field compact dict
+# --------------------------------------------------------------------------
+
+def _excerpt(text: str, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars].rsplit(" ", 1)[0]
+    return (cut or text[:max_chars]) + "…"
+
+
+def _iso(ts) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return ""
+
+
+def normalize_post(raw: dict, excerpt_chars: int) -> dict:
+    """Field allowlist: keep 8 fields, drop everything else."""
+    pid = str(raw.get("id") or "").removeprefix("t3_")
+    permalink = raw.get("permalink") or f"/r/{raw.get('subreddit')}/comments/{pid}/"
+    return {
+        "id": pid,
+        "title": re.sub(r"\s+", " ", str(raw.get("title") or "")).strip(),
+        "subreddit": str(raw.get("subreddit") or ""),
+        "score": int(raw.get("score") or 0),
+        "num_comments": int(raw.get("num_comments") or 0),
+        "created": _iso(raw.get("created_utc")),
+        "url": f"https://www.reddit.com{permalink}" if permalink.startswith("/") else str(permalink),
+        "excerpt": _excerpt(str(raw.get("selftext") or ""), excerpt_chars),
+    }
+
+
+def normalize_comment(raw: dict, max_chars: int) -> dict:
+    return {
+        "id": str(raw.get("id") or ""),
+        "author": str(raw.get("author") or "[deleted]"),
+        "score": int(raw.get("score") or 0),
+        "created": _iso(raw.get("created_utc")),
+        "body": _excerpt(str(raw.get("body") or ""), max_chars),
+    }
+
+
+def rank_posts(posts: list[dict], now_ts: float) -> list[dict]:
+    """Gravity ranking: score / (age_hours + 2) ^ 1.5. Deterministic."""
+
+    def gravity(p: dict) -> float:
+        try:
+            age_h = max(0.0, (now_ts - datetime.datetime.strptime(
+                p["created"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()) / 3600)
+        except (ValueError, KeyError):
+            age_h = 24.0
+        return p["score"] / ((age_h + 2) ** 1.5)
+
+    return sorted(posts, key=gravity, reverse=True)
+
+
+def dedup(posts: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out = []
+    for p in posts:
+        if p["id"] and p["id"] not in seen:
+            seen.add(p["id"])
+            out.append(p)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Backends
+# --------------------------------------------------------------------------
+
+class ArcticShiftBackend:
+    name = "arctic-shift"
+
+    def _paged(self, params: dict, limit: int) -> list[dict]:
+        """Page with `before` cursor until limit reached or exhausted."""
+        out: list[dict] = []
+        before: int | None = None
+        while len(out) < limit:
+            p = dict(params)
+            p["limit"] = min(100, limit - len(out))
+            if before:
+                p["before"] = before
+            url = f"{ARCTIC_BASE}/api/posts/search?{urllib.parse.urlencode(p)}"
+            data = fetch_json(url)
+            batch = data.get("data", []) if isinstance(data, dict) else []
+            if not batch:
+                break
+            out.extend(batch)
+            try:
+                before = int(float(batch[-1].get("created_utc", 0)))
+            except (TypeError, ValueError):
+                break
+            if len(batch) < p["limit"]:
+                break
+        return out
+
+    def search_posts(self, query: str, subreddit: str, limit: int, after_utc: float) -> list[dict]:
+        params = {"subreddit": subreddit, "sort": "desc", "sort_type": "created_utc"}
+        if query:
+            # NOTE: `query` (full-text over title+selftext) requires sort_type.
+            params["query"] = query
+        batch = self._paged(params, limit)
+        # client-side time filter (reliable even if server ignores `after`)
+        return [p for p in batch if float(p.get("created_utc") or 0) >= after_utc]
+
+    def browse_filter(self, query: str, subreddit: str, limit: int, after_utc: float) -> list[dict]:
+        """Last resort: browse latest posts, filter by keyword client-side.
+
+        Plain listing is the most reliable endpoint; fetch 5x to compensate
+        for filter losses.
+        """
+        batch = self._paged({"subreddit": subreddit, "sort": "desc",
+                             "sort_type": "created_utc"}, limit * 5)
+        q = query.lower()
+        return [p for p in batch
+                if float(p.get("created_utc") or 0) >= after_utc
+                and q in ((p.get("title") or "") + " " + (p.get("selftext") or "")).lower()]
+
+    def get_comments(self, post_id: str, limit: int) -> list[dict]:
+        pid = post_id.removeprefix("t3_")
+        url = (f"{ARCTIC_BASE}/api/comments/tree?link_id=t3_{pid}"
+               f"&limit={min(1000, max(limit * 5, 100))}")
+        data = fetch_json(url)
+        if isinstance(data, dict):
+            items = data.get("data") or data.get("comments") or []
+        else:
+            items = data if isinstance(data, list) else []
+        # unwrap Reddit listing envelope {"kind": "t1", "data": {...}} and
+        # flatten the tree breadth-first (top-level first)
+        flat: list[dict] = []
+        queue = list(items)
+        while queue:
+            node = queue.pop(0)
+            if not isinstance(node, dict):
+                continue
+            c = node.get("data") if node.get("kind") in ("t1", "more") and isinstance(
+                node.get("data"), dict) else node
+            if node.get("kind") == "more":
+                continue  # collapsed branch placeholder, skip
+            flat.append(c)
+            replies = c.get("replies")
+            if isinstance(replies, dict):
+                kids = replies.get("data", {}).get("children", [])
+                queue.extend(kids)
+            elif isinstance(replies, list):
+                queue.extend(replies)
+        return sorted(flat, key=lambda c: int(c.get("score") or 0), reverse=True)[:limit]
+
+
+class PullPushBackend:
+    name = "pullpush"
+
+    def search_posts(self, query: str, subreddit: str, limit: int, after_utc: float) -> list[dict]:
+        # NOTE: /topic errors when `subreddit` is passed; query globally and
+        # filter client-side instead.
+        params = {"q": query or "*", "size": min(100, limit), "sort": "desc"}
+        url = f"{PULLPUSH_BASE}/topic?{urllib.parse.urlencode(params)}"
+        data = fetch_json(url)
+        batch = data.get("data", []) if isinstance(data, dict) else []
+        want = subreddit.lower()
+        return [p for p in batch
+                if float(p.get("created_utc") or 0) >= after_utc
+                and (want in ("all", "*") or str(p.get("subreddit") or "").lower() == want)][:limit]
+
+    def get_comments(self, post_id: str, limit: int) -> list[dict]:
+        pid = post_id.removeprefix("t3_")
+        params = {"link_id": f"t3_{pid}", "size": min(100, limit), "sort": "desc"}
+        url = f"{PULLPUSH_BASE}/comment?{urllib.parse.urlencode(params)}"
+        data = fetch_json(url)
+        batch = data.get("data", []) if isinstance(data, dict) else []
+        return sorted(batch, key=lambda c: int(c.get("score") or 0), reverse=True)[:limit]
+
+
+BACKENDS = {"arctic-shift": ArcticShiftBackend, "pullpush": PullPushBackend}
+
+
+def with_fallback(backend_name: str, fn, *args):
+    """Try requested backend, fall back to the other one on failure.
+
+    Three-level search strategy lives in cmd_search/cmd_digest:
+      1. Arctic Shift full-text `query`   (best, but index flakes)
+      2. PullPush full-text `q`           (independent backend)
+      3. Arctic Shift browse + client-side keyword filter (always works)
+    """
+    order = [backend_name] if backend_name != "auto" else ["arctic-shift", "pullpush"]
+    if backend_name != "auto":
+        order.append("pullpush" if backend_name == "arctic-shift" else "arctic-shift")
+    errors = []
+    for name in order:
+        try:
+            backend = BACKENDS[name]()
+            return backend, fn(backend, *args)
+        except BackendError as e:
+            errors.append(f"{name}: {e}")
+    raise BackendError(" | ".join(errors))
+
+
+# --------------------------------------------------------------------------
+# Time parsing
+# --------------------------------------------------------------------------
+
+def parse_since(s: str, now_ts: float) -> float:
+    s = s.strip().lower()
+    m = re.fullmatch(r"(\d+)\s*h", s)
+    if m:
+        return now_ts - int(m.group(1)) * 3600
+    m = re.fullmatch(r"(\d+)\s*d", s)
+    if m:
+        return now_ts - int(m.group(1)) * 86400
+    try:
+        dt = datetime.datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        raise ValueError(f"bad --since value: {s!r} (use 24h, 7d, 30d or YYYY-MM-DD)")
+
+
+# --------------------------------------------------------------------------
+# Renderers
+# --------------------------------------------------------------------------
+
+def render_table(posts: list[dict]) -> str:
+    lines = ["| # | Title | Sub | 👍 | 💬 | Time |",
+             "|---|-------|-----|----|----|------|"]
+    for i, p in enumerate(posts, 1):
+        title = p["title"].replace("|", "\\|")
+        if len(title) > 90:
+            title = title[:87] + "…"
+        lines.append(f"| {i} | {title} | r/{p['subreddit']} | {p['score']} | {p['num_comments']} | {p['created'][:10]} |")
+        if p["excerpt"]:
+            lines.append(f"|   | ↳ {p['excerpt'][:200].replace('|', chr(92)+'|')} |||||")
+        lines.append(f"|   | ↳ {p['url']} |||||")
+    return "\n".join(lines)
+
+
+def render_comments(comments: list[dict]) -> str:
+    lines = []
+    for i, c in enumerate(comments, 1):
+        lines.append(f"**{i}. u/{c['author']}** (👍{c['score']}, {c['created'][:10]})")
+        lines.append(f"> {c['body']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def render_digest(query: str, posts: list[dict], since: str) -> str:
+    total_comments = sum(p["num_comments"] for p in posts)
+    subs = sorted({p["subreddit"] for p in posts if p["subreddit"]})
+    lines = [f"# Reddit digest: \"{query}\" (since {since})",
+             f"- Posts: {len(posts)} | Comments: {total_comments} | Subs: {', '.join('r/'+s for s in subs)}",
+             "", "## Top discussions (agent: summarize into 3 themes + 1-line sentiment)"]
+    for i, p in enumerate(posts, 1):
+        lines.append(f"{i}. **{p['title']}** — r/{p['subreddit']}, 👍{p['score']}, 💬{p['num_comments']}, {p['created']}")
+        if p["excerpt"]:
+            lines.append(f"   > {p['excerpt']}")
+        lines.append(f"   {p['url']}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def cmd_search(a) -> int:
+    now_ts = time.time()
+    try:
+        after_utc = parse_since(a.since, now_ts)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    subs = [s.strip() for s in a.subs.split(",") if s.strip()] or ["all"]
+
+    # fetch raw, normalize, filter, rank
+    def fetch_all(backend):
+        raw_posts = []
+        for sub in subs:
+            raw_posts.extend(backend.search_posts(a.query, sub, a.limit * 2, after_utc))
+        normed = [normalize_post(p, a.excerpt_chars) for p in raw_posts]
+        if a.min_score > 0:
+            normed = [p for p in normed if p["score"] >= a.min_score]
+        return rank_posts(dedup(normed), now_ts)[:a.limit]
+
+    def fetch_browse_fallback():
+        """Level 3: Arctic Shift browse + client-side filter. Always works."""
+        backend = ArcticShiftBackend()
+        raw_posts = []
+        for sub in subs:
+            raw_posts.extend(backend.browse_filter(a.query, sub, a.limit * 2, after_utc))
+        normed = [normalize_post(p, a.excerpt_chars) for p in raw_posts]
+        if a.min_score > 0:
+            normed = [p for p in normed if p["score"] >= a.min_score]
+        return backend, rank_posts(dedup(normed), now_ts)[:a.limit]
+
+    try:
+        backend, posts = with_fallback(a.backend, fetch_all)
+    except BackendError as e:
+        if not a.query or a.backend not in ("auto", "arctic-shift"):
+            print(f"error: all backends failed: {e}", file=sys.stderr)
+            return 2
+        try:
+            backend, posts = fetch_browse_fallback()
+            print(f"<!-- note: full-text index unavailable, used browse+filter fallback -->",
+                  file=sys.stderr)
+        except BackendError as e2:
+            print(f"error: all backends failed: {e} | fallback: {e2}", file=sys.stderr)
+            return 2
+
+    if a.format == "json":
+        print(json.dumps({"backend": backend.name, "count": len(posts), "posts": posts},
+                         ensure_ascii=False, indent=1))
+    else:
+        print(f"<!-- backend: {backend.name} | posts: {len(posts)} -->")
+        print(render_table(posts) if posts else "_no posts found_")
+    return 0
+
+
+def cmd_comments(a) -> int:
+    def fetch_all(backend):
+        raw = backend.get_comments(a.post_id, a.top)
+        return [normalize_comment(c, a.max_chars) for c in raw][:a.top]
+
+    try:
+        backend, comments = with_fallback(a.backend, fetch_all)
+    except BackendError as e:
+        print(f"error: all backends failed: {e}", file=sys.stderr)
+        return 2
+
+    if a.format == "json":
+        print(json.dumps({"backend": backend.name, "count": len(comments), "comments": comments},
+                         ensure_ascii=False, indent=1))
+    else:
+        print(f"<!-- backend: {backend.name} | comments: {len(comments)} -->")
+        print(render_comments(comments) if comments else "_no comments found_")
+    return 0
+
+
+def cmd_digest(a) -> int:
+    now_ts = time.time()
+    try:
+        after_utc = parse_since(a.since, now_ts)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    subs = [s.strip() for s in a.subs.split(",") if s.strip()] or ["all"]
+
+    def fetch_all(backend):
+        raw_posts = []
+        for sub in subs:
+            raw_posts.extend(backend.search_posts(a.query, sub, a.limit * 2, after_utc))
+        normed = [normalize_post(p, 300) for p in raw_posts]
+        return rank_posts(dedup(normed), now_ts)[:a.limit]
+
+    def fetch_browse_fallback():
+        backend = ArcticShiftBackend()
+        raw_posts = []
+        for sub in subs:
+            raw_posts.extend(backend.browse_filter(a.query, sub, a.limit * 2, after_utc))
+        normed = [normalize_post(p, 300) for p in raw_posts]
+        return backend, rank_posts(dedup(normed), now_ts)[:a.limit]
+
+    try:
+        backend, posts = with_fallback(a.backend, fetch_all)
+    except BackendError as e:
+        if a.backend not in ("auto", "arctic-shift"):
+            print(f"error: all backends failed: {e}", file=sys.stderr)
+            return 2
+        try:
+            backend, posts = fetch_browse_fallback()
+        except BackendError as e2:
+            print(f"error: all backends failed: {e} | fallback: {e2}", file=sys.stderr)
+            return 2
+
+    if a.format == "json":
+        print(json.dumps({"backend": backend.name, "query": a.query,
+                          "count": len(posts), "posts": posts},
+                         ensure_ascii=False, indent=1))
+    else:
+        print(render_digest(a.query, posts, a.since) if posts
+              else f"_no posts for \"{a.query}\" since {a.since}_")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="reddit-intel",
+        description="Token-efficient Reddit intelligence CLI for LLM agents. "
+                    "Free data via Arctic Shift / PullPush archives, no API key needed.")
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--subs", default="all",
+                        help="comma-separated subreddits (default: all)")
+        sp.add_argument("--since", default="7d",
+                        help="time window: 24h, 7d, 30d or YYYY-MM-DD (default: 7d)")
+        sp.add_argument("--limit", type=int, default=10,
+                        help="max posts to return (default: 10)")
+        sp.add_argument("--format", choices=["compact", "json"], default="compact",
+                        help="output format (default: compact)")
+        sp.add_argument("--backend", choices=["auto", "arctic-shift", "pullpush"],
+                        default="auto", help="data backend (default: auto with fallback)")
+
+    s = sub.add_parser("search", help="search posts (compact table by default)")
+    s.add_argument("query", help="full-text query (empty string = browse latest)")
+    s.add_argument("--min-score", type=int, default=0, help="minimum post score")
+    s.add_argument("--excerpt-chars", type=int, default=200, help="excerpt length")
+    common(s)
+    s.set_defaults(func=cmd_search)
+
+    c = sub.add_parser("comments", help="top comments of a post")
+    c.add_argument("post_id", help="post id (with or without t3_ prefix)")
+    c.add_argument("--top", type=int, default=20, help="max comments (default: 20)")
+    c.add_argument("--max-chars", type=int, default=300, help="body truncate length")
+    c.add_argument("--format", choices=["compact", "json"], default="compact")
+    c.add_argument("--backend", choices=["auto", "arctic-shift", "pullpush"], default="auto")
+    c.set_defaults(func=cmd_comments)
+
+    d = sub.add_parser("digest", help="agent briefing prep: ranked posts for a topic window")
+    d.add_argument("query", help="topic query")
+    common(d)
+    d.set_defaults(func=cmd_digest)
+
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
