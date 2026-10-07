@@ -51,7 +51,11 @@ BACKFILL_SECONDS = 36 * 3600
 CPH_MIN_AGE_HOURS = 0.25
 
 PAGE_SIZE = 100
-MAX_PAGES = 10  # 1000 posts per subreddit, then the window is reported truncated
+# 1000 posts per subreddit, then the window is reported truncated.
+MAX_WINDOW_POSTS = 1000
+# Safety cap on successful pages. Shrinking the page after a timeout (100 -> 50
+# -> 25) still stops at MAX_WINDOW_POSTS, not at a fixed page count.
+MAX_PAGE_REQUESTS = 40
 POST_FIELDS = "id,title,subreddit,score,num_comments,created_utc,selftext"
 
 COMMENT_PAGE_SIZE = 100
@@ -376,11 +380,17 @@ def _iso(ts) -> str:
 
 
 def format_epoch(ts: float) -> str:
-    """Epoch seconds for an Arctic Shift `after`/`before` parameter."""
-    if abs(ts - round(ts)) < 1e-6:
-        return str(int(round(ts)))
-    text = f"{ts:.3f}".rstrip("0").rstrip(".")
-    return text or "0"
+    """Integer epoch seconds for Arctic Shift `after` / `before`.
+
+    The API accepts epoch seconds, epoch milliseconds, and ISO dates. A
+    fractional second such as ``time.time() - 86400`` is rejected with
+    HTTP 400 (``'after' must be a valid date``). Flooring widens the server
+    window by less than a second; callers still drop rows older than the
+    exact instant.
+    """
+    if ts <= 0:
+        return "0"
+    return str(int(ts))
 
 
 def created_epoch(iso: str) -> float | None:
@@ -759,6 +769,16 @@ def measure_engagement(posts: list[dict], candidates: list[dict], counter, cache
 # Backends
 # --------------------------------------------------------------------------
 
+def _timeout_error(exc: BaseException) -> bool:
+    """True when Arctic Shift (or the socket) gave up on this query.
+
+    The API's own guidance for ``Timeout. Maybe slow down a bit`` is to lower
+    ``limit``. Retrying the identical heavy page does not.
+    """
+    text = str(exc).lower()
+    return "422" in text or "timeout" in text or "timed out" in text
+
+
 def _enqueue_replies(comment: dict, queue: deque) -> None:
     replies = comment.get("replies")
     if isinstance(replies, dict):
@@ -783,16 +803,21 @@ class ArcticShiftBackend:
         created_utc on that page. That cursor is exclusive: a live check on
         r/wallstreetbets returned the next older page with zero id overlap.
         A short page, a cursor that does not move, or the window start ends
-        the scan. Hitting MAX_PAGES sets truncated.
+        the scan. Hitting MAX_WINDOW_POSTS (or the request cap) sets truncated.
+        A 422 timeout shrinks the page (100, then 50, then 25) instead of
+        repeating the same heavy request.
         """
         out: list[dict] = []
         seen: set[str] = set()
         before: float | None = None
-        for _page in range(MAX_PAGES):
+        page_limit = PAGE_SIZE
+        shrinks = 0
+        requests = 0
+        while requests < MAX_PAGE_REQUESTS and len(out) < MAX_WINDOW_POSTS:
             params: dict[str, str | int] = {
                 "subreddit": subreddit,
                 "sort": "desc",
-                "limit": PAGE_SIZE,
+                "limit": page_limit,
                 "after": format_epoch(after_utc),
                 "fields": POST_FIELDS,
             }
@@ -801,7 +826,23 @@ class ArcticShiftBackend:
             if before is not None:
                 params["before"] = format_epoch(before)
             url = f"{ARCTIC_BASE}/api/posts/search?{urllib.parse.urlencode(params)}"
-            data = self._fetch(url)
+            try:
+                # One retry of this exact URL (warm-up), then shrink. The default
+                # 3 identical attempts just repeat a query the server already
+                # refused as too heavy.
+                data = self._fetch(url, retries=2)
+            except BackendError as exc:
+                if (not _timeout_error(exc)) or page_limit <= 25 or shrinks >= 3:
+                    raise
+                smaller = max(25, page_limit // 2)
+                write_err(
+                    f"<!-- note: Arctic Shift timed out at limit={page_limit}; "
+                    f"retrying this page at limit={smaller} -->"
+                )
+                page_limit = smaller
+                shrinks += 1
+                continue
+            requests += 1
             batch = data.get("data") if isinstance(data, dict) else None
             if not isinstance(batch, list):
                 raise BackendError("unexpected posts payload from Arctic Shift")
@@ -830,7 +871,7 @@ class ArcticShiftBackend:
                 out.append(raw)
             if oldest is None:
                 break
-            page_full = len(batch) >= PAGE_SIZE
+            page_full = len(batch) >= page_limit
             if not page_full or reached_start or oldest <= after_utc:
                 break
             if new_count == 0:
@@ -839,7 +880,7 @@ class ArcticShiftBackend:
                 break
             before = oldest
         else:
-            # Every page was full and still inside the window.
+            # Hit the post cap or the request cap while the window was still open.
             return out, True
         return out, False
 
@@ -1392,7 +1433,7 @@ def cmd_posts(args, *, digest: bool) -> int:
     if gathered.truncated:
         write_err(
             "<!-- note: time window truncated at "
-            f"{MAX_PAGES * PAGE_SIZE} posts per subreddit; narrow --since -->"
+            f"{MAX_WINDOW_POSTS} posts per subreddit; narrow --since -->"
         )
     if info["pending"] and not engagement:
         write_err(

@@ -44,9 +44,11 @@ You write the summary. The CLI does not call an LLM.
 
 - `--subs a,b` — required. Prefixes `r/` and `/r/` are accepted. Names must
   match `[A-Za-z0-9_]{2,30}`.
-- `--since 24h|7d|30d|YYYY-MM-DD` — real server-side window (`after` + paging),
-  not "the newest 20 posts". Capped at 1000 posts per subreddit; the output
-  says `truncated: yes` when that happens. Narrow the window.
+- `--since 24h|7d|30d|YYYY-MM-DD` — real server-side window (integer `after`
+  + paging), not "the newest 20 posts". Pages start at 100 and drop to 50
+  then 25 if Arctic Shift returns a 422 timeout. Capped at 1000 posts per
+  subreddit; the output says `truncated: yes` when that happens. Narrow the
+  window.
 - `--engagement` — opt in on `search` and `digest`. Measures up to
   `--engagement-top` young posts (default 8, hard max 12) via the comment
   search endpoint, caches counts for 15 minutes, paces at ~1 request / 1.5s.

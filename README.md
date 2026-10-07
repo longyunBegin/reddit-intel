@@ -77,11 +77,13 @@ and comment-count requests at about 1 per 1.5s.
 
 ### How the time window works
 
-`--since` is sent as Arctic Shift `after`. Pages of 100 walk backward with an
+`--since` is sent as an integer epoch `after`. Pages walk backward with an
 exclusive `before` cursor until the window starts, a short page comes back, or
-**1000 posts per subreddit**. A truncated window is called out in the output;
-narrow `--since` or `--subs` to finish it. Ranking happens after that scan,
-not on the newest handful of rows.
+**1000 posts per subreddit**. A page starts at 100 posts; a 422 timeout retries
+that page at 50, then 25, because a full page of bodies on a busy sub times
+out. A truncated window is called out in the output; narrow `--since` or
+`--subs` to finish it. Ranking happens after that scan, not on the newest
+handful of rows.
 
 ## How token saving works
 

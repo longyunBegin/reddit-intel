@@ -87,7 +87,7 @@ class RedditIntelTest(unittest.TestCase):
         self._saved = {
             "pace": mod.PACE_SECONDS,
             "epace": mod.ENGAGEMENT_PACE_SECONDS,
-            "pages": mod.MAX_PAGES,
+            "pages": mod.MAX_WINDOW_POSTS,
             "sleep": mod.time.sleep,
             "uniform": mod.random.uniform,
             "urlopen": mod.urllib.request.urlopen,
@@ -107,7 +107,7 @@ class RedditIntelTest(unittest.TestCase):
     def tearDown(self):
         mod.PACE_SECONDS = self._saved["pace"]
         mod.ENGAGEMENT_PACE_SECONDS = self._saved["epace"]
-        mod.MAX_PAGES = self._saved["pages"]
+        mod.MAX_WINDOW_POSTS = self._saved["pages"]
         mod.time.sleep = self._saved["sleep"]
         mod.random.uniform = self._saved["uniform"]
         mod.urllib.request.urlopen = self._saved["urlopen"]
@@ -119,6 +119,12 @@ class RedditIntelTest(unittest.TestCase):
         else:
             os.environ["REDDIT_INTEL_CACHE"] = self._saved["cache_env"]
         self._tmpdir.cleanup()
+
+    def test_format_epoch_is_integer_seconds(self):
+        # Fractional seconds are a live HTTP 400 from Arctic Shift.
+        self.assertEqual(mod.format_epoch(1_700_000_000.9), "1700000000")
+        self.assertEqual(mod.format_epoch(1_700_000_000.0), "1700000000")
+        self.assertEqual(mod.format_epoch(-5), "0")
 
     def test_parse_since_and_subs(self):
         now = 1_000_000.0
@@ -263,7 +269,7 @@ class RedditIntelTest(unittest.TestCase):
         after = 1_700_000_000
         calls = []
 
-        def fetch(url, pace=None):
+        def fetch(url, **_kwargs):
             calls.append(url)
             query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
             if "before" not in query:
@@ -290,10 +296,10 @@ class RedditIntelTest(unittest.TestCase):
         self.assertEqual(len({row["id"] for row in rows}), len(rows))
 
     def test_window_truncated_at_page_cap(self):
-        mod.MAX_PAGES = 2
+        mod.MAX_WINDOW_POSTS = mod.PAGE_SIZE * 2
         after = 100
 
-        def fetch(url, pace=None):
+        def fetch(url, **_kwargs):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
             # Stay strictly above `after` so the scan never observes the window start.
             if "before" not in query:
@@ -310,6 +316,35 @@ class RedditIntelTest(unittest.TestCase):
         rows, truncated = mod.ArcticShiftBackend(fetch=fetch).search_window("", "stocks", after)
         self.assertTrue(truncated)
         self.assertEqual(len(rows), 2 * mod.PAGE_SIZE)
+
+    def test_timeout_shrinks_page_and_keeps_going(self):
+        calls = []
+
+        def fetch(url, **_kwargs):
+            calls.append(url)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            limit = int(query["limit"][0])
+            if limit > 50:
+                raise mod.BackendError('HTTP 422 {"error":"Timeout. Maybe slow down a bit"}')
+            return {"data": [{
+                "id": "a",
+                "created_utc": 5_000,
+                "title": "t",
+                "subreddit": "wallstreetbets",
+                "selftext": "",
+                "score": 1,
+                "num_comments": 0,
+            }]}
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rows, truncated = mod.ArcticShiftBackend(fetch=fetch).search_window("", "wallstreetbets", 1_000)
+        self.assertFalse(truncated)
+        self.assertEqual([row["id"] for row in rows], ["a"])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("limit=100", calls[0])
+        self.assertIn("limit=50", calls[1])
+        self.assertIn("limit=50", err.getvalue())
 
     def test_keyword_fallback_matches_every_term_and_runs_once(self):
         now = mod.time.time()
