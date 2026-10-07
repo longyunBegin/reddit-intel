@@ -384,6 +384,18 @@ def cmd_search(a) -> int:
             print(f"error: all backends failed: {e} | fallback: {e2}", file=sys.stderr)
             return 2
 
+    # Empty-result fallback: backends succeeded but found nothing for the query.
+    # Browse+filter often rescues this (stale/partial archive indexes).
+    if not posts and a.query and a.backend in ("auto", "arctic-shift"):
+        try:
+            b2, more = fetch_browse_fallback()
+            if more:
+                backend, posts = b2, more
+                print("<!-- note: query returned 0, browse+filter fallback found results -->",
+                      file=sys.stderr)
+        except BackendError:
+            pass
+
     if a.format == "json":
         print(json.dumps({"backend": backend.name, "count": len(posts), "posts": posts},
                          ensure_ascii=False, indent=1))
@@ -448,6 +460,15 @@ def cmd_digest(a) -> int:
         except BackendError as e2:
             print(f"error: all backends failed: {e} | fallback: {e2}", file=sys.stderr)
             return 2
+
+    # Empty-result fallback (see cmd_search).
+    if not posts and a.query and a.backend in ("auto", "arctic-shift"):
+        try:
+            b2, more = fetch_browse_fallback()
+            if more:
+                backend, posts = b2, more
+        except BackendError:
+            pass
 
     if a.format == "json":
         print(json.dumps({"backend": backend.name, "query": a.query,
