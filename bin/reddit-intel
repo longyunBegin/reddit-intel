@@ -10,30 +10,41 @@ Exit codes: 0 ok, 1 usage error, 2 all backends failed. Never prompts.
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import datetime
+import http.client
 import json
 import os
 import pathlib
 import random
 import re
+import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 USER_AGENT = (
     f"reddit-intel/{VERSION} (token-efficient agent tool; "
     "contact: github.com/longyunBegin/reddit-intel)"
 )
 REQUEST_TIMEOUT = 30
-# Minimum gap between archive requests. Engagement counts use a slower pace.
-PACE_SECONDS = 1.0
-ENGAGEMENT_PACE_SECONDS = 1.5
 RETRIES = 3
+# Parallel archive requests. Arctic Shift is volunteer-run: keep this small.
+FETCH_WORKERS = 4
+# Token-bucket pacing shared by every request thread. Starts brisk, backs off
+# on 429s and slow-query timeouts, recovers slowly. Replaces the old fixed
+# 1.0s gap between requests.
+PACER_RATE = 2.5
+PACER_CAPACITY = 4
+PACER_MIN_RATE = 0.4
+PACER_MAX_RATE = 4.0
 # 429 waits honor X-RateLimit-Reset, but never longer than this.
 # Observed resets on real 429s were ~25-43s; a cap avoids a bad header
 # parking the process for minutes.
@@ -66,7 +77,205 @@ ENGAGEMENT_TOP_MAX = 12
 CACHE_TTL_SECONDS = 15 * 60
 CACHE_MAX_ENTRIES = 200
 
-_last_request_ts = 0.0
+
+class AdaptivePacer:
+    """Thread-safe token bucket shared by all request threads.
+
+    Starts at PACER_RATE tokens/sec with a small burst capacity. Congestion
+    signals (429, slow-query timeouts) halve the rate; successes recover it
+    slowly. This keeps polite pressure on the volunteer-run archive without
+    the old fixed 1.0s gap serializing every request.
+    """
+
+    def __init__(self, rate=PACER_RATE, capacity=PACER_CAPACITY,
+                 min_rate=PACER_MIN_RATE, max_rate=PACER_MAX_RATE):
+        self._rate = float(rate)
+        self._capacity = float(capacity)
+        self._min_rate = float(min_rate)
+        self._max_rate = float(max_rate)
+        self._tokens = float(capacity)
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self._capacity,
+                    self._tokens + (now - self._updated) * self._rate,
+                )
+                self._updated = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                deficit = (1.0 - self._tokens) / self._rate
+            time.sleep(min(deficit, 0.05))
+
+    def on_congestion(self) -> None:
+        with self._lock:
+            self._rate = max(self._min_rate, self._rate * 0.5)
+
+    def on_success(self) -> None:
+        with self._lock:
+            self._rate = min(self._max_rate, self._rate * 1.02)
+
+
+_PACER = AdaptivePacer()
+
+
+def _proxy_for_url(scheme: str, host: str) -> str | None:
+    """Proxy URL from the environment, honoring no_proxy. None means direct.
+
+    urllib did this for us before; the pooled transport has to do it itself.
+    """
+    if not host:
+        return None
+    no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+    h = host.lower().rstrip(".")
+    for entry in no_proxy.replace(";", ",").split(","):
+        e = entry.strip().lower().rstrip(".")
+        if not e:
+            continue
+        e = e.split(":")[0].lstrip("[").rstrip("]")
+        if e == "*" or h == e or h.endswith("." + e):
+            return None
+    if scheme == "https":
+        return (
+            os.environ.get("https_proxy")
+            or os.environ.get("HTTPS_PROXY")
+            or os.environ.get("all_proxy")
+            or os.environ.get("ALL_PROXY")
+        )
+    return (
+        os.environ.get("http_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("all_proxy")
+        or os.environ.get("ALL_PROXY")
+    )
+
+
+def _tunnel_socket(proxy_url: str, host: str, port: int, timeout: float):
+    """Open a CONNECT tunnel through the proxy; return the plain socket."""
+    parts = urllib.parse.urlsplit(proxy_url)
+    phost = parts.hostname or ""
+    pport = parts.port or 8080
+    tunnel = http.client.HTTPConnection(phost, pport, timeout=timeout)
+    theaders: dict[str, str] = {}
+    if parts.username:
+        user = urllib.parse.unquote(parts.username)
+        pwd = urllib.parse.unquote(parts.password or "")
+        token = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+        theaders["Proxy-Authorization"] = f"Basic {token}"
+    tunnel.set_tunnel(host, port, headers=theaders)
+    try:
+        tunnel.connect()
+    except Exception:
+        tunnel.close()
+        raise
+    raw = tunnel.sock
+    tunnel.sock = None  # detach: we own the socket from here on
+    return raw
+
+
+class _ProxiedHTTPConnection(http.client.HTTPConnection):
+    """Plain-HTTP connection via a forward proxy (absolute-URI requests)."""
+
+    def __init__(self, proxy_host: str, proxy_port: int, origin: str, timeout: float):
+        super().__init__(proxy_host, proxy_port, timeout=timeout)
+        self._origin = origin
+
+    def request(self, method, url, body=None, headers={}, *, encode_chunked=False):
+        if not url.startswith(("http://", "https://")):
+            url = self._origin + url
+        super().request(method, url, body, headers, encode_chunked=encode_chunked)
+
+
+class _ConnPool:
+    """Thread-local keep-alive connections, one per (scheme, host, port, proxy).
+
+    urllib opens a fresh TCP+TLS connection per request; reusing the
+    connection drops a few hundred ms of handshake from every call. Proxy
+    tunnels (CONNECT) are pooled the same way.
+    """
+
+    def __init__(self):
+        self._tls = threading.local()
+
+    def _conns(self) -> dict:
+        try:
+            return self._tls.conns
+        except AttributeError:
+            self._tls.conns = {}
+            return self._tls.conns
+
+    def drop(self, key) -> None:
+        conn = self._conns().pop(key, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _new(self, scheme: str, host: str, port: int, timeout: float, proxy: str | None):
+        if proxy:
+            if scheme == "https":
+                raw = _tunnel_socket(proxy, host, port, timeout)
+                ctx = ssl.create_default_context()
+                tls = ctx.wrap_socket(raw, server_hostname=host)
+                conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+                conn.sock = tls  # pre-connected: connect() is skipped
+                return conn
+            parts = urllib.parse.urlsplit(proxy)
+            return _ProxiedHTTPConnection(
+                parts.hostname or "", parts.port or 8080,
+                f"http://{host}:{port}", timeout,
+            )
+        if scheme == "https":
+            return http.client.HTTPSConnection(host, port, timeout=timeout)
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+
+    def get(self, scheme: str, host: str, port: int, timeout: float):
+        proxy = _proxy_for_url(scheme, host)
+        key = (scheme, host, port, proxy)
+        conn = self._conns().get(key)
+        if conn is None:
+            conn = self._new(scheme, host, port, timeout, proxy)
+            self._conns()[key] = conn
+        return conn, key
+
+
+_CONN_POOL = _ConnPool()
+
+
+def _http_get(url: str, headers: dict, timeout: float):
+    """GET via pooled keep-alive connections.
+
+    Returns (status, headers_dict, body_bytes). Transport failures raise
+    OSError/TimeoutError/http.client.HTTPException; HTTP error statuses are
+    returned, not raised, so the caller can classify them.
+    """
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme or "https"
+    host = parts.hostname or ""
+    port = parts.port or (443 if scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    last_exc: BaseException | None = None
+    for _ in range(2):
+        conn, key = _CONN_POOL.get(scheme, host, port, timeout)
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, dict(resp.getheaders()), body
+        except (http.client.HTTPException, OSError, TimeoutError) as exc:
+            # Stale or half-closed keep-alive connection: drop it and retry
+            # once with a fresh one before surfacing the error.
+            last_exc = exc
+            _CONN_POOL.drop(key)
+    raise last_exc  # type: ignore[misc]
 
 SUBS_ERROR = (
     "error: --subs is required (example: --subs stocks,investing). "
@@ -271,66 +480,58 @@ def _classify_status(url: str, code: int, body: str, headers) -> None:
     raise RetryableError(f"HTTP {code} {_snip(body)}".strip(), "transient", headers)
 
 
-def fetch_json(url: str, retries: int = RETRIES, pace: float | None = None):
+def fetch_json(url: str, retries: int = RETRIES):
     """GET JSON. Retry 429s against the rate-limit header and transient errors
     with jitter. 400/404 and other client errors fail on the first response.
     Does not sleep after the attempt that gives up.
+
+    Transport goes through pooled keep-alive connections; pacing is a shared
+    adaptive token bucket, so concurrent callers stay polite without a fixed
+    per-request sleep.
     """
-    global _last_request_ts
     if retries < 1:
         raise BackendError("retries must be >= 1")
-    gap = PACE_SECONDS if pace is None else max(0.0, pace)
     last_err: BackendError | None = None
     for attempt in range(retries):
-        waited = gap - (time.monotonic() - _last_request_ts)
-        if waited > 0:
-            time.sleep(waited)
-        _last_request_ts = time.monotonic()
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-        )
+        _PACER.wait()
         try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                raw_bytes = resp.read()
-                status = getattr(resp, "status", 200) or 200
-                headers = getattr(resp, "headers", None)
-                if status != 200:
-                    body = raw_bytes.decode("utf-8", "replace") if raw_bytes else ""
+            status, headers, raw_bytes = _http_get(
+                url,
+                {"User-Agent": USER_AGENT, "Accept": "application/json"},
+                REQUEST_TIMEOUT,
+            )
+        except (http.client.HTTPException, OSError, TimeoutError) as exc:
+            last_err = RetryableError(f"{type(exc).__name__}: {exc}", "transient", None)
+        else:
+            if status != 200:
+                body = raw_bytes.decode("utf-8", "replace") if raw_bytes else ""
+                try:
                     _classify_status(url, int(status), body, headers)
+                except FatalBackendError:
+                    raise
+                except RetryableError as classified:
+                    last_err = classified
+                    _PACER.on_congestion()
+            else:
                 try:
                     parsed = json.loads(raw_bytes.decode("utf-8"))
                 except (UnicodeError, json.JSONDecodeError) as exc:
-                    raise RetryableError(f"bad JSON: {exc}", "transient", None) from exc
-                if (
-                    isinstance(parsed, dict)
-                    and parsed.get("data") is None
-                    and isinstance(parsed.get("error"), str)
-                ):
-                    message = parsed["error"]
-                    if "timeout" in message.lower():
-                        raise RetryableError(message, "transient", headers)
-                    raise FatalBackendError(message)
-                return parsed
-        except FatalBackendError:
-            raise
-        except RetryableError as exc:
-            last_err = exc
-        except urllib.error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
-            try:
-                _classify_status(url, int(exc.code), body, exc.headers)
-            except FatalBackendError:
-                raise
-            except RetryableError as classified:
-                last_err = classified
-        except urllib.error.URLError as exc:
-            last_err = RetryableError(f"URLError: {exc.reason}", "transient", None)
-        except (TimeoutError, OSError) as exc:
-            last_err = RetryableError(f"{type(exc).__name__}: {exc}", "transient", None)
+                    last_err = RetryableError(f"bad JSON: {exc}", "transient", None)
+                else:
+                    if (
+                        isinstance(parsed, dict)
+                        and parsed.get("data") is None
+                        and isinstance(parsed.get("error"), str)
+                    ):
+                        message = parsed["error"]
+                        if "timeout" in message.lower():
+                            last_err = RetryableError(message, "transient", headers)
+                            _PACER.on_congestion()
+                        else:
+                            raise FatalBackendError(message)
+                    else:
+                        _PACER.on_success()
+                        return parsed
         if last_err is None:
             raise BackendError("request failed")
         if attempt + 1 >= retries:
@@ -486,6 +687,14 @@ def normalize_post(raw: dict, excerpt_chars: int, now_ts: float) -> dict | None:
     }
     if body_removed:
         post["removed"] = True
+    # Internal ranking signal: how many query aliases matched this post.
+    # Stripped before output; never leaks into JSON.
+    try:
+        hits = int(raw.get("_alias_hits") or 1)
+    except (TypeError, ValueError):
+        hits = 1
+    if hits > 1:
+        post["_alias_hits"] = hits
     return post
 
 
@@ -508,6 +717,17 @@ def normalize_comment(raw: dict, max_chars: int) -> dict:
     }
 
 
+def split_aliases(query: str) -> list[str]:
+    """`optical interconnect|CPO|1.6T` -> three aliases, OR'd together.
+
+    One query string fans out to several independent searches whose results
+    are merged and ranked. Empty query -> [""] (browse the window).
+    """
+    parts = [(query or "").split("|")]
+    aliases = [part.strip() for part in parts[0] if part.strip()]
+    return aliases or [""]
+
+
 def query_terms(query: str) -> list[str]:
     """Terms that must all match. Quoted phrases stay one term.
 
@@ -527,6 +747,23 @@ def query_terms(query: str) -> list[str]:
     return terms
 
 
+_ASCII_TERM = re.compile(r"[A-Za-z0-9]+(?:[.'\-/][A-Za-z0-9]+)*")
+
+
+def _term_regex(term: str) -> "re.Pattern[str] | None":
+    """Word-boundary regex for ASCII terms; None means plain substring.
+
+    Substring matching turns "1.6T" into a match for "$6 trillion". \b fixes
+    that for ASCII, but it does not behave for CJK (every char is a word
+    char), so non-ASCII terms keep substring matching. A trailing `s?`
+    keeps English plurals ("interconnects") matching the singular term.
+    """
+    if _ASCII_TERM.fullmatch(term):
+        plural = "s?" if len(term) > 1 else ""
+        return re.compile(r"\b" + re.escape(term) + plural + r"\b")
+    return None
+
+
 def raw_haystack(raw: dict) -> str:
     title = raw.get("title")
     body = raw.get("selftext")
@@ -536,10 +773,18 @@ def raw_haystack(raw: dict) -> str:
 
 
 def matches_terms(raw: dict, terms: list[str]) -> bool:
+    """AND across terms within one alias (mirrors the server full-text)."""
     if not terms:
         return True
     hay = raw_haystack(raw)
-    return all(term in hay for term in terms)
+    for term in terms:
+        rx = _term_regex(term)
+        if rx is not None:
+            if not rx.search(hay):
+                return False
+        elif term not in hay:
+            return False
+    return True
 
 
 def gravity_score(post: dict, now_ts: float) -> float:
@@ -549,6 +794,15 @@ def gravity_score(post: dict, now_ts: float) -> float:
 
 
 def rank_key(post: dict, now_ts: float, engagement: bool) -> tuple:
+    # Posts matching several query aliases get a multiplicative boost: a hit
+    # on "optical interconnect|CPO" from both aliases outranks a single hit.
+    # Single-alias searches all carry hits=1, so their order is unchanged.
+    try:
+        hits = float(post.get("_alias_hits") or 1)
+    except (TypeError, ValueError):
+        hits = 1.0
+    if hits < 1:
+        hits = 1.0
     created = created_epoch(post.get("created") or "") or 0.0
     pid = post.get("id") or ""
     if engagement:
@@ -556,11 +810,11 @@ def rank_key(post: dict, now_ts: float, engagement: bool) -> tuple:
         # posts old enough to have a real score. Tier 1: young posts we did
         # not measure (the engagement cap). Newer created wins ties.
         if post.get("comments_source") == "live":
-            return (2, float(post.get("comments_per_hour") or 0.0), created, pid)
+            return (2, hits * float(post.get("comments_per_hour") or 0.0), created, pid)
         if post.get("score_status") != "pending":
-            return (2, gravity_score(post, now_ts), created, pid)
+            return (2, hits * gravity_score(post, now_ts), created, pid)
         return (1, 0.0, created, pid)
-    return (gravity_score(post, now_ts), created, pid)
+    return (hits * gravity_score(post, now_ts), created, pid)
 
 
 def rank_posts(posts: list[dict], now_ts: float, engagement: bool = False) -> list[dict]:
@@ -733,10 +987,13 @@ def measure_engagement(posts: list[dict], candidates: list[dict], counter, cache
     """Attach live counts. counter(post_id) -> (count, capped) or BackendError.
 
     Returns (measured, failed). One post's failure does not drop the search.
+    Cache hits resolve inline; misses fan out across worker threads behind
+    the shared rate limiter.
     """
     measured = 0
     failed = 0
     by_id = {post["id"]: post for post in posts if post.get("id")}
+    todo: list[dict] = []
     for cand in candidates:
         post = by_id.get(cand.get("id") or "")
         if post is None:
@@ -745,23 +1002,33 @@ def measure_engagement(posts: list[dict], candidates: list[dict], counter, cache
         if cached is not None:
             annotate_live_comments(post, cached[0], cached[1], now_ts)
             measured += 1
-            continue
+        else:
+            todo.append(post)
+
+    def _count(pid: str):
         try:
-            count, capped = counter(post["id"])
+            count, capped = counter(pid)
         except BackendError:
-            failed += 1
-            continue
+            return None
         try:
             count_i = int(count)
         except (TypeError, ValueError):
-            failed += 1
-            continue
+            return None
         if count_i < 0:
-            failed += 1
-            continue
-        cache.put(post["id"], count_i, bool(capped))
-        annotate_live_comments(post, count_i, bool(capped), now_ts)
-        measured += 1
+            return None
+        return (count_i, bool(capped))
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            fetched = list(ex.map(_count, [post["id"] for post in todo]))
+        for post, res in zip(todo, fetched):
+            if res is None:
+                failed += 1
+                continue
+            count_i, capped = res
+            cache.put(post["id"], count_i, capped)
+            annotate_live_comments(post, count_i, capped, now_ts)
+            measured += 1
     return measured, failed
 
 
@@ -795,8 +1062,14 @@ class ArcticShiftBackend:
     def __init__(self, fetch=None):
         self._fetch = fetch or fetch_json
 
-    def search_window(self, query: str, subreddit: str, after_utc: float) -> tuple[list[dict], bool]:
+    def search_window(self, query: str, subreddit: str, after_utc: float,
+                      before_utc: float | None = None,
+                      budget: "_ScanBudget | None" = None) -> tuple[list[dict], bool]:
         """Posts with created_utc >= after_utc, newest first.
+
+        before_utc bounds the top of the slice (exclusive), letting callers
+        split a window into small parallel slices instead of one heavy scan.
+        When None the scan starts at the newest post, as before.
 
         The server receives `after`, so the time window is not "the newest
         limit*2 rows". Full pages continue with `before` set to the oldest
@@ -809,11 +1082,12 @@ class ArcticShiftBackend:
         """
         out: list[dict] = []
         seen: set[str] = set()
-        before: float | None = None
+        before: float | None = before_utc
         page_limit = PAGE_SIZE
         shrinks = 0
         requests = 0
-        while requests < MAX_PAGE_REQUESTS and len(out) < MAX_WINDOW_POSTS:
+        while (requests < MAX_PAGE_REQUESTS and len(out) < MAX_WINDOW_POSTS
+               and not (budget is not None and budget.exhausted)):
             params: dict[str, str | int] = {
                 "subreddit": subreddit,
                 "sort": "desc",
@@ -869,6 +1143,8 @@ class ArcticShiftBackend:
                 seen.add(pid)
                 new_count += 1
                 out.append(raw)
+            if budget is not None and new_count:
+                budget.take(new_count)
             if oldest is None:
                 break
             page_full = len(batch) >= page_limit
@@ -908,7 +1184,7 @@ class ArcticShiftBackend:
             if before is not None:
                 params["before"] = format_epoch(before)
             url = f"{ARCTIC_BASE}/api/comments/search?{urllib.parse.urlencode(params)}"
-            data = self._fetch(url, pace=ENGAGEMENT_PACE_SECONDS)
+            data = self._fetch(url)
             batch = data.get("data") if isinstance(data, dict) else None
             if not isinstance(batch, list):
                 raise BackendError(f"unexpected comments payload for {pid}")
@@ -1050,81 +1326,220 @@ class GatherResult:
     notes: list[str]
 
 
-def _consume(batch: list[dict], stats: dict) -> None:
-    for raw in batch:
-        if not isinstance(raw, dict):
-            continue
-        stats["scanned"] += 1
-        try:
-            ts = float(raw.get("created_utc"))
-        except (TypeError, ValueError):
-            continue
-        if stats["oldest"] is None or ts < stats["oldest"]:
-            stats["oldest"] = ts
+def _time_slices(after_utc: float, now_ts: float) -> list[tuple[float, float | None]]:
+    """Split [after_utc, now_ts] into day-chunks, newest first.
+
+    Each slice is (slice_after, slice_before); slice_before is None for the
+    newest slice. Small responses time out less on the archive, and slices
+    scan in parallel. A <=24h window stays a single slice.
+    """
+    span_days = max(0.0, (now_ts - after_utc) / 86400.0)
+    if span_days <= 10:
+        step_days = 1.0
+    elif span_days <= 31:
+        step_days = 3.0
+    else:
+        step_days = 7.0
+    step = step_days * 86400.0
+    slices: list[tuple[float, float | None]] = []
+    top = now_ts
+    while top > after_utc and len(slices) < 12:
+        bottom = max(after_utc, top - step)
+        slices.append((bottom, None if top >= now_ts else top))
+        top = bottom
+    if top > after_utc and slices:
+        # Fold a long tail into the oldest slice instead of dropping it.
+        slices[-1] = (after_utc, slices[-1][1])
+    return slices or [(after_utc, None)]
 
 
-def gather_posts(query: str, subs: list[str], after_utc: float, backend_name: str) -> GatherResult:
-    """Fetch the time window.
+class _ScanBudget:
+    """Post budget shared by one sub's time slices.
 
-    auto / arctic-shift never call PullPush. A full-text failure, or a query
-    that returns zero rows, runs the browse+keyword pass once — not twice
-    when that pass is also empty.
+    Slicing a window must not multiply the per-sub cap: without a shared
+    budget, 7 slices x 1000 posts turns a big-sub browse into 7000 fetches.
+    """
+
+    def __init__(self, total: int):
+        self._remaining = total
+        self._lock = threading.Lock()
+
+    def take(self, n: int) -> None:
+        with self._lock:
+            self._remaining = max(0, self._remaining - n)
+
+    @property
+    def exhausted(self) -> bool:
+        with self._lock:
+            return self._remaining <= 0
+
+
+def _merge_alias_rows(per_alias: list[list[dict]]) -> list[dict]:
+    """Merge rows from several query aliases.
+
+    Each post is annotated with _alias_hits (how many aliases matched it)
+    for ranking; normalize_post strips it before output.
+    """
+    merged: dict[str, dict] = {}
+    hits: dict[str, int] = {}
+    for rows in per_alias:
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            pid = str(raw.get("id") or "").removeprefix("t3_").strip()
+            if not pid:
+                continue
+            if pid in merged:
+                hits[pid] += 1
+            else:
+                merged[pid] = raw
+                hits[pid] = 1
+    out: list[dict] = []
+    for pid, raw in merged.items():
+        if hits[pid] > 1:
+            raw = dict(raw)
+            raw["_alias_hits"] = hits[pid]
+        out.append(raw)
+    return out
+
+
+def gather_posts(queries: list[str], subs: list[str], after_utc: float,
+                 backend_name: str, now_ts: float) -> GatherResult:
+    """Fetch the time window for every query alias.
+
+    Aliases (split from `a|b|c`) each run their own full-text pass; results
+    merge with per-post alias-hit counts for ranking. A full-text failure,
+    or an alias that returns zero rows, falls back to one shared
+    browse+keyword pass filtered per alias — not twice when that pass is
+    also empty. auto / arctic-shift never call PullPush. Full-text scans
+    run per sub in parallel; the unfiltered browse is sliced into small
+    parallel chunks behind a shared adaptive rate limiter.
     """
     notes: list[str] = []
-    if backend_name == "pullpush":
-        backend = PullPushBackend()
-        raw: list[dict] = []
-        stats = {"scanned": 0, "oldest": None}
-        for sub in subs:
-            batch = backend.search_posts(query, sub, 100, after_utc)
-            _consume(batch, stats)
-            raw.extend(batch)
-        return GatherResult("pullpush", raw, stats["scanned"], stats["oldest"], False, notes)
-
-    backend = ArcticShiftBackend()
-    server_query = (query or "").strip()
-    terms = query_terms(server_query)
     stats = {"scanned": 0, "oldest": None}
 
-    def browse_filtered() -> tuple[list[dict], bool]:
+    def track(batch: list[dict]) -> None:
+        for raw in batch:
+            if not isinstance(raw, dict):
+                continue
+            stats["scanned"] += 1
+            try:
+                ts = float(raw.get("created_utc"))
+            except (TypeError, ValueError):
+                continue
+            if stats["oldest"] is None or ts < stats["oldest"]:
+                stats["oldest"] = ts
+
+    if backend_name == "pullpush":
+        backend = PullPushBackend()
+        per_alias: list[list[dict]] = []
+        for query in queries:
+            rows: list[dict] = []
+            for sub in subs:
+                batch = backend.search_posts(query, sub, 100, after_utc)
+                track(batch)
+                rows.extend(batch)
+            per_alias.append(rows)
+        merged = _merge_alias_rows(per_alias)
+        return GatherResult("pullpush", merged, stats["scanned"], stats["oldest"], False, notes)
+
+    backend = ArcticShiftBackend()
+    slices = _time_slices(after_utc, now_ts)
+    truncated = False
+
+    def parallel_scan(query: str) -> tuple[list[dict], bool]:
+        """Full-text: one scan per sub, no slicing.
+
+        Selective queries return few rows; slicing them would only multiply
+        requests. The 422 shrink logic inside search_window handles heavy
+        queries.
+        """
         rows: list[dict] = []
         trunc = False
-        for sub in subs:
-            batch, sub_trunc = backend.search_window("", sub, after_utc)
-            trunc = trunc or sub_trunc
-            _consume(batch, stats)
-            if terms:
-                batch = [row for row in batch if matches_terms(row, terms)]
-            rows.extend(batch)
+        budgets = {sub: _ScanBudget(MAX_WINDOW_POSTS) for sub in subs}
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            futs = [
+                ex.submit(backend.search_window, query, sub, after_utc, None,
+                          budgets[sub])
+                for sub in subs
+            ]
+            try:
+                for fut in as_completed(futs):
+                    batch, sub_trunc = fut.result()
+                    trunc = trunc or sub_trunc
+                    track(batch)
+                    rows.extend(batch)
+            except BackendError:
+                for f in futs:
+                    f.cancel()
+                raise
         return rows, trunc
 
-    if not terms:
-        rows, trunc = browse_filtered()
-        return GatherResult(backend.name, rows, stats["scanned"], stats["oldest"], trunc, notes)
+    def parallel_browse() -> tuple[list[dict], bool]:
+        """Unfiltered window scan, sliced into small parallel chunks.
 
-    try:
-        rows = []
+        Slicing keeps each response small (fewer 422s); slices of one sub
+        share a MAX_WINDOW_POSTS budget so the cap is not multiplied.
+        """
+        rows: list[dict] = []
         trunc = False
-        for sub in subs:
-            batch, sub_trunc = backend.search_window(server_query, sub, after_utc)
-            trunc = trunc or sub_trunc
-            _consume(batch, stats)
-            rows.extend(batch)
-    except BackendError as exc:
-        notes.append(
-            f"<!-- note: full-text search failed ({exc}); used browse+filter once -->"
-        )
-        stats["scanned"] = 0
-        stats["oldest"] = None
-        rows, trunc = browse_filtered()
-        return GatherResult(backend.name, rows, stats["scanned"], stats["oldest"], trunc, notes)
+        budgets = {sub: _ScanBudget(MAX_WINDOW_POSTS) for sub in subs}
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+            futs = [
+                ex.submit(backend.search_window, "", sub, s_after, s_before,
+                          budgets[sub])
+                for sub in subs
+                for (s_after, s_before) in slices
+            ]
+            for fut in as_completed(futs):
+                batch, sub_trunc = fut.result()
+                trunc = trunc or sub_trunc
+                track(batch)
+                rows.extend(batch)
+        return rows, trunc
 
-    if not rows:
-        notes.append("<!-- note: full-text query returned 0; used browse+filter once -->")
-        stats["scanned"] = 0
-        stats["oldest"] = None
-        rows, trunc = browse_filtered()
-    return GatherResult(backend.name, rows, stats["scanned"], stats["oldest"], trunc, notes)
+    # Phase 1: full-text per alias.
+    per_alias: list[list[dict]] = [[] for _ in queries]
+    alias_terms: list[list[str]] = []
+    need_browse: list[int] = []
+    for qi, query in enumerate(queries):
+        server_query = query.strip()
+        terms = query_terms(server_query)
+        alias_terms.append(terms)
+        if not terms:
+            need_browse.append(qi)
+            continue
+        try:
+            rows, sub_trunc = parallel_scan(server_query)
+        except BackendError as exc:
+            notes.append(
+                f"<!-- note: full-text search failed ({exc}); used browse+filter once -->"
+            )
+            need_browse.append(qi)
+            continue
+        if not rows:
+            notes.append("<!-- note: full-text query returned 0; used browse+filter once -->")
+            need_browse.append(qi)
+            continue
+        truncated = truncated or sub_trunc
+        per_alias[qi] = rows
+
+    # Phase 2: a single shared browse; each alias filters it with its terms.
+    # The browse pass does not depend on the query, so running it once per
+    # (sub, slice) instead of once per alias cuts the fallback cost by the
+    # number of aliases.
+    if need_browse:
+        browse_rows, browse_trunc = parallel_browse()
+        truncated = truncated or browse_trunc
+        for qi in need_browse:
+            terms = alias_terms[qi]
+            if terms:
+                per_alias[qi] = [row for row in browse_rows if matches_terms(row, terms)]
+            else:
+                per_alias[qi] = list(browse_rows)
+
+    merged = _merge_alias_rows(per_alias)
+    return GatherResult(backend.name, merged, stats["scanned"], stats["oldest"], truncated, notes)
 
 
 def prepare_posts(
@@ -1133,6 +1548,8 @@ def prepare_posts(
     now_ts: float,
     excerpt_chars: int,
     min_score: int,
+    min_comments: int = 0,
+    drop_removed: bool = True,
     limit: int,
     engagement: bool,
     engagement_top: int,
@@ -1153,6 +1570,10 @@ def prepare_posts(
         if post is not None:
             normed.append(post)
     normed = dedup(normed)
+    if drop_removed:
+        # Bodies of [removed]/[deleted] carry no signal for an agent; the
+        # flag set by normalize_post lets --include-removed keep them.
+        normed = [post for post in normed if not post.get("removed")]
     if min_score > 0:
         kept: list[dict] = []
         for post in normed:
@@ -1164,6 +1585,18 @@ def prepare_posts(
                 # Honoring --min-score here would hide the entire recent window.
                 kept.append(post)
                 info["min_score_kept_pending"] += 1
+                continue
+        normed = kept
+    if min_comments > 0:
+        kept = []
+        for post in normed:
+            if post["num_comments"] >= min_comments:
+                kept.append(post)
+                continue
+            if post["score_status"] == "pending":
+                # num_comments is backfilled like score; live counts arrive
+                # via --engagement after this filter.
+                kept.append(post)
                 continue
         normed = kept
     info["pending"] = sum(1 for post in normed if post.get("score_status") == "pending")
@@ -1391,6 +1824,11 @@ def cmd_posts(args, *, digest: bool) -> int:
                 )
                 engagement_top = ENGAGEMENT_TOP_MAX
         min_score = int(getattr(args, "min_score", 0) or 0)
+        min_comments = int(getattr(args, "min_comments", 0) or 0)
+        if min_comments < 0:
+            raise ValueError("error: --min-comments must be >= 0")
+        drop_removed = not bool(getattr(args, "include_removed", False))
+        aliases = split_aliases(getattr(args, "query", "") or "")
     except ValueError as exc:
         message = str(exc)
         if not message.startswith("error:"):
@@ -1399,7 +1837,7 @@ def cmd_posts(args, *, digest: bool) -> int:
         return 1
 
     try:
-        gathered = gather_posts(args.query, subs, after_utc, args.backend)
+        gathered = gather_posts(aliases, subs, after_utc, args.backend, now_ts)
     except BackendError as exc:
         write_err(f"error: all backends failed: {exc}")
         return 2
@@ -1415,12 +1853,17 @@ def cmd_posts(args, *, digest: bool) -> int:
         now_ts=now_ts,
         excerpt_chars=args.excerpt_chars,
         min_score=min_score,
+        min_comments=min_comments,
+        drop_removed=drop_removed,
         limit=args.limit,
         engagement=engagement,
         engagement_top=engagement_top,
         counter=counter,
         cache=cache,
     )
+    # Internal ranking signal; never leaks into output.
+    for post in posts:
+        post.pop("_alias_hits", None)
     for note in gathered.notes:
         write_err(note)
     if capped_note:
@@ -1546,6 +1989,17 @@ def _add_window_flags(parser, *, since_default: str, engagement_top_default: int
     )
     parser.add_argument("--limit", type=int, default=10, help="max posts to return (default: 10)")
     parser.add_argument(
+        "--min-comments",
+        type=int,
+        default=0,
+        help="minimum comment count; posts younger than 36h are kept regardless (default: 0)",
+    )
+    parser.add_argument(
+        "--include-removed",
+        action="store_true",
+        help="keep posts whose body is [removed]/[deleted] (dropped by default)",
+    )
+    parser.add_argument(
         "--excerpt-chars",
         type=int,
         default=200,
@@ -1587,13 +2041,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     search = sub.add_parser("search", help="search posts in a real --since window")
-    search.add_argument("query", help="full-text query; empty string browses the window")
+    search.add_argument(
+        "query",
+        help="full-text query; empty string browses the window; a|b|c tries aliases",
+    )
     search.add_argument("--min-score", type=int, default=0, help="minimum backfilled score")
     _add_window_flags(search, since_default="7d", engagement_top_default=ENGAGEMENT_TOP_DEFAULT)
     search.set_defaults(func=cmd_search, engagement=False)
 
     hot = sub.add_parser("hot", help="rank recent posts by live comments/hour")
-    hot.add_argument("query", nargs="?", default="", help="optional keyword filter")
+    hot.add_argument("query", nargs="?", default="", help="optional keyword filter; a|b|c tries aliases")
     hot.add_argument("--min-score", type=int, default=0, help="minimum backfilled score")
     _add_window_flags(hot, since_default="36h", engagement_top_default=10)
     hot.set_defaults(func=cmd_hot, engagement=True)
@@ -1611,7 +2068,7 @@ def build_parser() -> argparse.ArgumentParser:
     comments.set_defaults(func=cmd_comments)
 
     digest = sub.add_parser("digest", help="briefing prep: ranked posts for a topic window")
-    digest.add_argument("query", help="topic query")
+    digest.add_argument("query", help="topic query; a|b|c tries aliases")
     _add_window_flags(digest, since_default="7d", engagement_top_default=ENGAGEMENT_TOP_DEFAULT)
     digest.set_defaults(func=cmd_digest, engagement=False)
     return parser

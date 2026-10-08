@@ -51,9 +51,17 @@ You write the summary. The CLI does not call an LLM.
   window.
 - `--engagement` — opt in on `search` and `digest`. Measures up to
   `--engagement-top` young posts (default 8, hard max 12) via the comment
-  search endpoint, caches counts for 15 minutes, paces at ~1 request / 1.5s.
+  search endpoint, caches counts for 15 minutes. Counts fan out across
+  worker threads behind the shared rate limiter.
 - `--min-score` — applies only to posts older than 36h. Pending scores are not
   real yet, so they are kept.
+- `--min-comments` — same pending rule for comment counts.
+- `--include-removed` — keep posts whose body is `[removed]`/`[deleted]`.
+  Dropped by default; title-removed posts are always dropped.
+- `a|b|c` in the query — each alias runs its own full-text pass; results
+  merge and posts hit by several aliases rank higher. Within one alias
+  every term must match (word boundaries; English plurals ok; CJK falls
+  back to substring).
 - `--excerpt-chars` — excerpt length for search, hot, and digest (default 200).
 - `--format json` — the compact table's fields plus `score_status`.
 - `--backend pullpush` — explicit opt-in only. `auto` never calls PullPush.
@@ -72,7 +80,9 @@ about 36 hours later. Until then the archive value is usually score 1 and
   and a `/h` column. Posts older than 36h keep the real score and are ranked
   by gravity: `score / (age_hours + 2)^1.5`.
 - A title suffix `[removed]` means the body was removed or deleted. The excerpt
-  is empty. Posts whose title itself is `[removed]` or `[deleted]` are dropped.
+  is empty. Such posts are dropped by default (`--include-removed` keeps
+  them). Posts whose title itself is `[removed]` or `[deleted]` are always
+  dropped.
 
 The stdout comment line reports what was actually scanned:
 
@@ -91,7 +101,9 @@ is not repeated when it is also empty.
 
 Retries: 429 waits for `X-RateLimit-Reset` (cap 45s); 400/404 fail immediately;
 422 timeouts and 5xx use jittered backoff. The process does not sleep again
-after the final failure. Base pace is about 1 request/second.
+after the final failure. Requests run on 4 workers over pooled keep-alive
+connections (proxy env vars honored) with an adaptive rate limiter that
+backs off on congestion.
 
 Exit codes: `0` ok (including a genuinely empty window), `1` usage error,
 `2` backend failure.
