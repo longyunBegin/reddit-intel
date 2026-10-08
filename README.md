@@ -126,9 +126,11 @@ HTML block) and that response is not retried.
 Full-text search failures, and queries that return zero rows, fall back **once**
 to an Arctic Shift browse of the same window plus a client-side term filter.
 
-HTTP 429 waits for `X-RateLimit-Reset` (capped at 45s). HTTP 400/404 fail
-immediately. HTTP 422 timeouts and 5xx use jittered backoff. Nothing sleeps
-after the attempt that gives up. Please stay polite; these are volunteer archives.
+HTTP 429 waits for `X-RateLimit-Reset` (capped at 45s). HTTP 400/404 and
+unrecognized HTTP 422 responses fail immediately; only Arctic Shift's
+`Timeout. Maybe slow down a bit` 422 uses jittered backoff before the page is
+retried smaller. 5xx use jittered backoff. Nothing sleeps after the attempt
+that gives up. Please stay polite; these are volunteer archives.
 
 ## Exit codes
 
