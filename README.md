@@ -26,6 +26,9 @@ error (exit 1), not an empty digest.
 # Search posts in a real time window (compact table)
 ./bin/reddit-intel search "1.6T optical" --subs semiconductors,hardware --since 7d
 
+# One query, several aliases: results merge, posts hit by more aliases rank higher
+./bin/reddit-intel search "optical interconnect|CPO|1.6T" --subs semiconductors,hardware --since 7d
+
 # Recent posts ranked by live comments/hour (archive scores are stale for ~36h)
 ./bin/reddit-intel hot --subs stocks --since 24h --limit 10
 ./bin/reddit-intel search "earnings" --subs stocks --since 24h --engagement
@@ -45,6 +48,8 @@ error (exit 1), not an empty digest.
 | `--since` | `24h`, `7d`, `30d`, or `YYYY-MM-DD` (UTC) | `7d` (`36h` for `hot`) |
 | `--limit N` | max posts returned | `10` |
 | `--min-score N` | minimum score for posts older than 36h | `0` |
+| `--min-comments N` | minimum comment count (posts younger than 36h kept regardless) | `0` |
+| `--include-removed` | keep posts whose body is `[removed]`/`[deleted]` (dropped by default) | off |
 | `--excerpt-chars N` | excerpt length (search, digest, hot) | `200` |
 | `--format` | `compact` (markdown table) or `json` | `compact` |
 | `--backend` | `auto`, `arctic-shift`, or `pullpush` | `auto` |
@@ -52,9 +57,14 @@ error (exit 1), not an empty digest.
 | `--engagement-top N` | how many young posts to measure (max 12) | `8` (`10` for `hot`) |
 
 `search` takes a query (`""` browses the window). `hot` takes an optional query.
-Multi-word queries match every term (quoted phrases stay one term). The Arctic
-Shift `query` parameter is sent through unchanged; if that index errors or
-returns nothing, one browse of the same window is filtered the same way.
+`a|b|c` splits the query into aliases: each alias runs its own full-text
+pass and the results merge (posts matched by several aliases rank higher).
+Within one alias every term must match (quoted phrases stay one term), the
+way the server does it. Keyword filtering uses word boundaries, so `1.6T`
+no longer matches `$6 trillion`; English plurals still match (`s?`); CJK
+terms fall back to substring matching. The Arctic Shift `query` parameter
+is sent through unchanged; if that index errors or returns nothing, a
+single shared browse of the same window is filtered per alias the same way.
 
 ### Score pending and live engagement
 
@@ -72,18 +82,21 @@ backfilled about **36 hours** later, so younger posts usually show score 1 and
 
 Counts above 300 are a lower bound (`300+`). Results are cached for 15 minutes
 under `$XDG_CACHE_HOME/reddit-intel/engagement.json` (or `~/.cache/...`).
-Set `REDDIT_INTEL_CACHE=off` to disable the file. Requests stay at about 1/s,
-and comment-count requests at about 1 per 1.5s.
+Set `REDDIT_INTEL_CACHE=off` to disable the file. Requests run on 4 workers
+through pooled keep-alive connections (proxies honored via `*_proxy` env
+vars) behind a shared adaptive rate limiter: brisk when the archive is
+healthy, backing off on 429s and slow-query timeouts.
 
 ### How the time window works
 
-`--since` is sent as an integer epoch `after`. Pages walk backward with an
-exclusive `before` cursor until the window starts, a short page comes back, or
-**1000 posts per subreddit**. A page starts at 100 posts; a 422 timeout retries
-that page at 50, then 25, because a full page of bodies on a busy sub times
-out. A truncated window is called out in the output; narrow `--since` or
-`--subs` to finish it. Ranking happens after that scan, not on the newest
-handful of rows.
+`--since` is sent as an integer epoch `after`. Full-text queries scan one
+window per subreddit. The unfiltered browse fallback splits the window into
+day-sized slices that scan in parallel; slices of one sub share the
+**1000 posts per subreddit** budget so slicing never multiplies the fetch
+cap. A page starts at 100 posts; a 422 timeout retries that page at 50,
+then 25, because a full page of bodies on a busy sub times out. A truncated
+window is called out in the output; narrow `--since` or `--subs` to finish
+it. Ranking happens after that scan, not on the newest handful of rows.
 
 ## How token saving works
 

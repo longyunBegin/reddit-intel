@@ -43,61 +43,45 @@ def raw_post(pid, created, title="Hello", selftext="body", score=1, num_comments
     return row
 
 
-def http_error(code, body, headers=None, url="https://arctic-shift.photon-reddit.com/api/posts/search"):
-    hdr = http.client.HTTPMessage()
-    for key, value in (headers or {}).items():
-        hdr[key] = str(value)
-    payload = body if isinstance(body, bytes) else body.encode()
-    return urllib.error.HTTPError(url, code, "err", hdr, io.BytesIO(payload))
-
-
-class FakeResp:
-    def __init__(self, payload, status=200, headers=None):
-        self.status = status
-        self.headers = headers or {}
-        self._body = json.dumps(payload).encode()
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-class ScriptedOpen:
-    def __init__(self, responses):
-        self.responses = list(responses)
+class ScriptedHttp:
+    """Mock for mod._http_get: script of (status, headers, body) or Exception."""
+    def __init__(self, script):
+        self.script = list(script)
         self.urls = []
 
-    def __call__(self, req, timeout=None):
-        self.urls.append(req.full_url)
-        if not self.responses:
-            raise AssertionError(f"unexpected request {req.full_url}")
-        item = self.responses.pop(0)
+    def __call__(self, url, headers, timeout):
+        self.urls.append(url)
+        if not self.script:
+            raise AssertionError(f"unexpected request {url}")
+        item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        status, hdrs, body = item
+        if isinstance(body, dict):
+            body = json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        return status, dict(hdrs or {}), body
+
+
+def http_reply(code, body, headers=None):
+    return (code, headers or {}, body)
 
 
 class RedditIntelTest(unittest.TestCase):
     def setUp(self):
         self._saved = {
-            "pace": mod.PACE_SECONDS,
-            "epace": mod.ENGAGEMENT_PACE_SECONDS,
             "pages": mod.MAX_WINDOW_POSTS,
             "sleep": mod.time.sleep,
             "uniform": mod.random.uniform,
-            "urlopen": mod.urllib.request.urlopen,
-            "last": mod._last_request_ts,
+            "pacer": mod._PACER,
+            "http_get": mod._http_get,
             "search": mod.ArcticShiftBackend.search_window,
             "count": mod.ArcticShiftBackend.count_comments,
             "cache_env": os.environ.get("REDDIT_INTEL_CACHE"),
         }
-        mod.PACE_SECONDS = 0
-        mod.ENGAGEMENT_PACE_SECONDS = 0
+        # Tests must never wait on the rate limiter.
+        mod._PACER = mod.AdaptivePacer(rate=10000, capacity=10000)
         self._tmpdir = tempfile.TemporaryDirectory()
         os.environ["REDDIT_INTEL_CACHE"] = os.path.join(self._tmpdir.name, "cache.json")
         self.slept = []
@@ -105,13 +89,11 @@ class RedditIntelTest(unittest.TestCase):
         mod.random.uniform = lambda lo, hi: hi
 
     def tearDown(self):
-        mod.PACE_SECONDS = self._saved["pace"]
-        mod.ENGAGEMENT_PACE_SECONDS = self._saved["epace"]
         mod.MAX_WINDOW_POSTS = self._saved["pages"]
         mod.time.sleep = self._saved["sleep"]
         mod.random.uniform = self._saved["uniform"]
-        mod.urllib.request.urlopen = self._saved["urlopen"]
-        mod._last_request_ts = self._saved["last"]
+        mod._PACER = self._saved["pacer"]
+        mod._http_get = self._saved["http_get"]
         mod.ArcticShiftBackend.search_window = self._saved["search"]
         mod.ArcticShiftBackend.count_comments = self._saved["count"]
         if self._saved["cache_env"] is None:
@@ -177,83 +159,82 @@ class RedditIntelTest(unittest.TestCase):
         for code in (400, 404):
             with self.subTest(code=code):
                 self.slept.clear()
-                opener = ScriptedOpen([
-                    http_error(code, '{"error":"no"}', {"X-RateLimit-Reset": "40"}),
+                net = ScriptedHttp([
+                    http_reply(code, '{"error":"no"}', {"X-RateLimit-Reset": "40"}),
                 ])
-                mod.urllib.request.urlopen = opener
+                mod._http_get = net
                 with self.assertRaises(mod.FatalBackendError):
                     mod.fetch_json("https://arctic-shift.photon-reddit.com/api/posts/search?x=1")
-                self.assertEqual(len(opener.urls), 1)
+                self.assertEqual(len(net.urls), 1)
                 self.assertEqual(self.slept, [])
 
     def test_429_waits_for_header_and_not_after_final_attempt(self):
-        opener = ScriptedOpen([
-            http_error(429, "slow down", {"X-RateLimit-Reset": "30"}),
-            FakeResp({"data": []}),
+        net = ScriptedHttp([
+            http_reply(429, "slow down", {"X-RateLimit-Reset": "30"}),
+            http_reply(200, {"data": []}),
         ])
-        mod.urllib.request.urlopen = opener
+        mod._http_get = net
         payload = mod.fetch_json("https://arctic-shift.photon-reddit.com/api/posts/search?x=1")
         self.assertEqual(payload, {"data": []})
-        self.assertEqual(len(opener.urls), 2)
+        self.assertEqual(len(net.urls), 2)
         self.assertEqual(len(self.slept), 1)
         self.assertGreaterEqual(self.slept[0], 30)
         self.assertLessEqual(self.slept[0], 30.75)
 
         self.slept.clear()
-        opener = ScriptedOpen([
-            http_error(429, "slow down", {"X-RateLimit-Reset": "10"}),
-            http_error(429, "slow down", {"X-RateLimit-Reset": "10"}),
-            http_error(429, "slow down", {"X-RateLimit-Reset": "10"}),
+        net = ScriptedHttp([
+            http_reply(429, "slow down", {"X-RateLimit-Reset": "10"}),
+            http_reply(429, "slow down", {"X-RateLimit-Reset": "10"}),
+            http_reply(429, "slow down", {"X-RateLimit-Reset": "10"}),
         ])
-        mod.urllib.request.urlopen = opener
+        mod._http_get = net
         with self.assertRaises(mod.BackendError):
             mod.fetch_json("https://arctic-shift.photon-reddit.com/api/posts/search?x=1")
-        self.assertEqual(len(opener.urls), 3)
+        self.assertEqual(len(net.urls), 3)
         self.assertEqual(len(self.slept), 2)
 
         self.slept.clear()
-        opener = ScriptedOpen([
-            http_error(429, "slow down", {"X-RateLimit-Reset": "100"}),
-            FakeResp({"data": {"ok": True}}),
+        net = ScriptedHttp([
+            http_reply(429, "slow down", {"X-RateLimit-Reset": "100"}),
+            http_reply(200, {"data": {"ok": True}}),
         ])
-        mod.urllib.request.urlopen = opener
+        mod._http_get = net
         mod.fetch_json("https://arctic-shift.photon-reddit.com/api/posts/search?x=1")
         self.assertEqual(self.slept, [mod.RATE_LIMIT_CAP])
 
     def test_422_and_5xx_use_jitter_not_the_rate_limit_header(self):
-        opener = ScriptedOpen([
-            http_error(422, '{"error":"Timeout. Maybe slow down a bit"}', {"X-RateLimit-Reset": "40"}),
-            FakeResp({"data": [1]}),
+        net = ScriptedHttp([
+            http_reply(422, '{"error":"Timeout. Maybe slow down a bit"}', {"X-RateLimit-Reset": "40"}),
+            http_reply(200, {"data": [1]}),
         ])
-        mod.urllib.request.urlopen = opener
+        mod._http_get = net
         self.assertEqual(mod.fetch_json("https://arctic-shift.photon-reddit.com/x"), {"data": [1]})
         self.assertEqual(self.slept, [1.0])
 
         self.slept.clear()
-        opener = ScriptedOpen([
-            http_error(503, "unavailable", {"X-RateLimit-Reset": "40"}),
-            http_error(503, "unavailable", {"X-RateLimit-Reset": "40"}),
-            FakeResp({"data": []}),
+        net = ScriptedHttp([
+            http_reply(503, "unavailable", {"X-RateLimit-Reset": "40"}),
+            http_reply(503, "unavailable", {"X-RateLimit-Reset": "40"}),
+            http_reply(200, {"data": []}),
         ])
-        mod.urllib.request.urlopen = opener
+        mod._http_get = net
         mod.fetch_json("https://arctic-shift.photon-reddit.com/x")
         # attempt 0 -> 1s, attempt 1 -> 2s, uniform patched to the high end
         self.assertEqual(self.slept, [1.0, 2.0])
 
     def test_pullpush_refusal_is_not_retried(self):
-        opener = ScriptedOpen([
-            http_error(
+        net = ScriptedHttp([
+            http_reply(
                 429,
                 "This website does not provide free scraping resources for agents",
-                url="https://api.pullpush.io/topic?q=x",
             ),
-            FakeResp({"data": [{"id": "should-not-fetch"}]}),
+            http_reply(200, {"data": [{"id": "should-not-fetch"}]}),
         ])
-        mod.urllib.request.urlopen = opener
+        mod._http_get = net
         with self.assertRaises(mod.FatalBackendError) as ctx:
             mod.fetch_json("https://api.pullpush.io/topic?q=x")
         self.assertIn("agents", str(ctx.exception).lower())
-        self.assertEqual(len(opener.urls), 1)
+        self.assertEqual(len(net.urls), 1)
         self.assertEqual(self.slept, [])
 
     def test_rate_limit_header_parsing(self):
@@ -350,7 +331,7 @@ class RedditIntelTest(unittest.TestCase):
         now = mod.time.time()
         calls = []
 
-        def search_window(self, query, sub, after):
+        def search_window(self, query, sub, after, before=None, budget=None):
             calls.append(query)
             if query:
                 return [], False
@@ -372,7 +353,7 @@ class RedditIntelTest(unittest.TestCase):
 
         calls.clear()
 
-        def search_window_raises(self, query, sub, after):
+        def search_window_raises(self, query, sub, after, before=None, budget=None):
             calls.append(query)
             if query:
                 raise mod.BackendError("timeout")
@@ -386,7 +367,7 @@ class RedditIntelTest(unittest.TestCase):
 
         calls.clear()
 
-        def search_window_hit(self, query, sub, after):
+        def search_window_hit(self, query, sub, after, before=None, budget=None):
             calls.append(query)
             return [raw_post("hit", now - 10, title="alpha beta")], False
 
@@ -397,15 +378,15 @@ class RedditIntelTest(unittest.TestCase):
         self.assertEqual(calls, ["alpha beta"])
 
     def test_auto_does_not_call_pullpush(self):
-        opener = ScriptedOpen([FakeResp({"data": []}) for _ in range(6)])
-        mod.urllib.request.urlopen = opener
+        net = ScriptedHttp([http_reply(200, {"data": []}) for _ in range(6)])
+        mod._http_get = net
         out = io.StringIO()
         with redirect_stdout(out), redirect_stderr(io.StringIO()):
             code = mod.main(["search", "zzz", "--subs", "stocks", "--since", "1h", "--format", "json"])
         self.assertEqual(code, 0)
-        self.assertTrue(opener.urls)
-        self.assertTrue(all("arctic-shift.photon-reddit.com" in url for url in opener.urls))
-        self.assertTrue(all("pullpush" not in url for url in opener.urls))
+        self.assertTrue(net.urls)
+        self.assertTrue(all("arctic-shift.photon-reddit.com" in url for url in net.urls))
+        self.assertTrue(all("pullpush" not in url for url in net.urls))
 
     def test_removed_posts_permalink_and_excerpt(self):
         now = 1_800_000_000.0
@@ -567,7 +548,7 @@ class RedditIntelTest(unittest.TestCase):
         now = mod.time.time()
         calls = []
 
-        def search_window(self, query, sub, after):
+        def search_window(self, query, sub, after, before=None, budget=None):
             return [
                 raw_post(f"id{i}", now - (i + 1) * 60, title=f"title {i}")
                 for i in range(6)
@@ -598,6 +579,137 @@ class RedditIntelTest(unittest.TestCase):
             code = mod.main(["search", "", "--subs", "stocks", "--since", "24h", "--format", "json"])
         self.assertEqual(code, 0)
         self.assertEqual(calls, [])
+
+
+    def test_split_aliases(self):
+        self.assertEqual(mod.split_aliases("a|b|c"), ["a", "b", "c"])
+        self.assertEqual(mod.split_aliases("  a || b  "), ["a", "b"])
+        self.assertEqual(mod.split_aliases(""), [""])
+        self.assertEqual(mod.split_aliases("single"), ["single"])
+
+    def test_word_boundary_matching(self):
+        # "1.6T" must not match "$6 trillion" (substring false positive).
+        self.assertFalse(mod.matches_terms(
+            {"title": "Market cap near $6 trillion", "selftext": ""}, ["1.6t"]))
+        self.assertTrue(mod.matches_terms(
+            {"title": "New 1.6T optical modules shipping", "selftext": ""}, ["1.6t"]))
+        # Standalone acronyms don't match longer words.
+        self.assertTrue(mod.matches_terms(
+            {"title": "CPO vs pluggable", "selftext": ""}, ["cpo"]))
+        self.assertFalse(mod.matches_terms(
+            {"title": "SCPO adapters", "selftext": ""}, ["cpo"]))
+        # English plurals still match the singular term.
+        self.assertTrue(mod.matches_terms(
+            {"title": "optical interconnects are hot", "selftext": ""},
+            ["optical", "interconnect"]))
+        # ...but the false positive stays fixed.
+        self.assertFalse(mod.matches_terms(
+            {"title": "Market cap near $6 trillions", "selftext": ""}, ["1.6t"]))
+        # CJK has no word boundaries: substring fallback.
+        self.assertTrue(mod.matches_terms(
+            {"title": "这是光互连技术", "selftext": ""}, ["光互连"]))
+        # AND within one alias still holds (server parity).
+        self.assertFalse(mod.matches_terms(
+            {"title": "alpha only", "selftext": ""}, ["alpha", "beta"]))
+        self.assertTrue(mod.matches_terms(
+            {"title": "beta then alpha", "selftext": ""}, ["alpha", "beta"]))
+
+    def test_alias_merge_and_boost(self):
+        now = mod.time.time()
+
+        def search_window(self, query, sub, after, before=None, budget=None):
+            if query == "alpha":
+                return [raw_post("a1", now - 100, title="alpha here", score=10)], False
+            if query == "beta":
+                return [
+                    raw_post("a1", now - 100, title="alpha here", score=10),
+                    raw_post("b1", now - 100, title="beta here", score=10),
+                ], False
+            return [], False
+
+        mod.ArcticShiftBackend.search_window = search_window
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = mod.main([
+                "search", "alpha|beta", "--subs", "stocks", "--since", "24h",
+                "--format", "json",
+            ])
+        self.assertEqual(code, 0)
+        payload = json.loads(out.getvalue())
+        ids = [post["id"] for post in payload["posts"]]
+        # a1 matched both aliases: same gravity as b1, boosted first.
+        self.assertEqual(ids, ["a1", "b1"])
+        # Internal ranking signal never leaks into output.
+        self.assertTrue(all("_alias_hits" not in post for post in payload["posts"]))
+
+    def test_time_slices(self):
+        now = 1_800_000_000.0
+        day = 86400.0
+        self.assertEqual(len(mod._time_slices(now - day, now)), 1)
+        self.assertEqual(len(mod._time_slices(now - 7 * day, now)), 7)
+        self.assertEqual(len(mod._time_slices(now - 30 * day, now)), 10)
+        slices = mod._time_slices(now - 7 * day, now)
+        self.assertIsNone(slices[0][1])  # newest slice unbounded on top
+        self.assertEqual(slices[-1][0], now - 7 * day)  # oldest reaches the window start
+        # Slices are contiguous and ordered newest-first.
+        for (lo_a, hi_a), (lo_b, hi_b) in zip(slices, slices[1:]):
+            self.assertEqual(lo_a, hi_b)
+
+    def test_removed_posts_dropped_by_default(self):
+        now = 1_800_000_000.0
+        raws = [
+            raw_post("gone", now - 100, title="Some title", selftext="[removed]"),
+            raw_post("kept", now - 100, title="Fine title", selftext="body"),
+        ]
+        base = dict(now_ts=now, excerpt_chars=80, min_score=0, limit=10,
+                    engagement=False, engagement_top=8)
+        kept, _ = mod.prepare_posts(raws, **base)
+        self.assertEqual([post["id"] for post in kept], ["kept"])
+        kept, _ = mod.prepare_posts(raws, drop_removed=False, **base)
+        self.assertEqual({post["id"] for post in kept}, {"gone", "kept"})
+
+    def test_min_comments_keeps_pending(self):
+        now = 1_800_000_000.0
+        raws = [
+            raw_post("young", now - 3600, score=1, num_comments=0),
+            raw_post("old_low", now - 50 * 3600, score=5, num_comments=1),
+            raw_post("old_high", now - 50 * 3600, score=20, num_comments=8),
+        ]
+        kept, _ = mod.prepare_posts(
+            raws, now_ts=now, excerpt_chars=80, min_score=0, min_comments=5,
+            limit=10, engagement=False, engagement_top=8,
+        )
+        self.assertEqual({post["id"] for post in kept}, {"young", "old_high"})
+
+    def test_pacer_degrades_and_recovers(self):
+        pacer = mod.AdaptivePacer(rate=2.0, capacity=2, min_rate=0.5, max_rate=4.0)
+        pacer.on_congestion()
+        self.assertAlmostEqual(pacer._rate, 1.0)
+        pacer.on_congestion()
+        self.assertAlmostEqual(pacer._rate, 0.5)
+        pacer.on_congestion()
+        self.assertAlmostEqual(pacer._rate, 0.5)  # floor holds
+        for _ in range(300):
+            pacer.on_success()
+        self.assertAlmostEqual(pacer._rate, 4.0)  # ceiling holds
+
+    def test_proxy_for_url(self):
+        saved = dict(os.environ)
+        try:
+            for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
+                        "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"):
+                os.environ.pop(key, None)
+            self.assertIsNone(mod._proxy_for_url("https", "example.com"))
+            os.environ["https_proxy"] = "http://proxy:3128"
+            self.assertEqual(
+                mod._proxy_for_url("https", "example.com"), "http://proxy:3128")
+            os.environ["no_proxy"] = "example.com"
+            self.assertIsNone(mod._proxy_for_url("https", "example.com"))
+            self.assertEqual(
+                mod._proxy_for_url("https", "other.com"), "http://proxy:3128")
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
 
 
 if __name__ == "__main__":
