@@ -46,7 +46,8 @@ You write the summary. The CLI does not call an LLM.
   match `[A-Za-z0-9_]{2,30}`.
 - `--since 24h|7d|30d|YYYY-MM-DD` — real server-side window (integer `after`
   + paging), not "the newest 20 posts". Pages start at 100 and drop to 50
-  then 25 if Arctic Shift returns a 422 timeout. Capped at 1000 posts per
+  then 25 only for Arctic Shift's recognized 422 query-timeout response.
+  Capped at 1000 posts per
   subreddit; the output says `truncated: yes` when that happens. Narrow the
   window.
 - `--engagement` — opt in on `search` and `digest`. Measures up to
@@ -99,11 +100,12 @@ covered before ranking.
 rows, the same window is browsed once and filtered on the client. That browse
 is not repeated when it is also empty.
 
-Retries: 429 waits for `X-RateLimit-Reset` (cap 45s); 400/404 fail immediately;
-422 timeouts and 5xx use jittered backoff. The process does not sleep again
-after the final failure. Requests run on 4 workers over pooled keep-alive
-connections (proxy env vars honored) with an adaptive rate limiter that
-backs off on congestion.
+Retries: 429 waits for `X-RateLimit-Reset` (cap 45s); 400/404 and unrecognized
+422 responses fail immediately. Only Arctic Shift's recognized
+`Timeout. Maybe slow down a bit` 422 uses jittered backoff; 5xx use jittered
+backoff. The process does not sleep again after the final failure. Requests
+run on 4 workers over pooled keep-alive connections (proxy env vars honored)
+with an adaptive rate limiter that backs off on congestion.
 
 Exit codes: `0` ok (including a genuinely empty window), `1` usage error,
 `2` backend failure.

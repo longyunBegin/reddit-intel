@@ -300,7 +300,7 @@ class FatalBackendError(BackendError):
 class RetryableError(BackendError):
     def __init__(self, message: str, kind: str, headers=None):
         super().__init__(message)
-        # kind is "ratelimit" (HTTP 429) or "transient" (422/5xx/network).
+        # kind is "ratelimit" (HTTP 429) or "transient" (timeout 422/5xx/network).
         self.kind = kind
         self.headers = headers
 
@@ -420,10 +420,10 @@ def retry_delay(kind: str, attempt: int, headers) -> float:
     HTTP 429 waits for X-RateLimit-Reset (capped). Jitter is added only after
     that deadline so we never retry early.
 
-    HTTP 422 / 5xx / network errors use jittered exponential backoff and
-    ignore X-RateLimit-Reset. That header is attached to ordinary 200s as
-    well, and a request sent immediately after an Arctic Shift 422 Timeout
-    succeeds — the 422 is a slow query, not a hold.
+    Recognized Arctic Shift 422 query timeouts, 5xx, and network errors use
+    jittered exponential backoff and ignore X-RateLimit-Reset. That header is
+    attached to ordinary 200s as well, and a request sent immediately after an
+    Arctic Shift 422 Timeout succeeds — the 422 is a slow query, not a hold.
     """
     if attempt < 0:
         attempt = 0
@@ -466,6 +466,54 @@ def pullpush_refusal(url: str, code: int, body: str) -> str | None:
     return None
 
 
+def _http_error_message(body: str) -> str:
+    """Prefer a short server message over dumping an entire JSON error body."""
+    text = body or ""
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("error", "message", "detail"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                value = next(
+                    (value.get(nested) for nested in ("message", "detail", "error")
+                     if isinstance(value.get(nested), str)),
+                    None,
+                )
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return text
+
+
+_SECRET_ERROR_VALUE_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|client[_-]?secret|password|passwd|token|secret|cookie|session)"
+    r"\b[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic)\s+)?[^\s,;&}\"']+"
+)
+_BEARER_ERROR_VALUE_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\"'}]+")
+
+
+def _http_error_detail(body: str) -> str:
+    """Return bounded error context with common credential values redacted."""
+    text = _http_error_message(body)
+    text = _BEARER_ERROR_VALUE_RE.sub("Bearer [redacted]", text)
+    text = _SECRET_ERROR_VALUE_RE.sub(
+        lambda match: f"{match.group(1)}=[redacted]", text
+    )
+    return _snip(text)
+
+
+def _is_arctic_shift_timeout_422(url: str, body: str) -> bool:
+    """Only retry Arctic Shift's documented slow-query 422 response."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    if host.lower() != (urllib.parse.urlparse(ARCTIC_BASE).hostname or "").lower():
+        return False
+    message = re.sub(r"\s+", " ", _http_error_message(body)).strip().casefold()
+    return "timeout. maybe slow down a bit" in message
+
+
 def _classify_status(url: str, code: int, body: str, headers) -> None:
     """Raise FatalBackendError or RetryableError for an HTTP error status."""
     refusal = pullpush_refusal(url, code, body)
@@ -473,7 +521,13 @@ def _classify_status(url: str, code: int, body: str, headers) -> None:
         raise FatalBackendError(refusal)
     if code == 429:
         raise RetryableError(f"HTTP 429 {_snip(body)}".strip(), "ratelimit", headers)
-    if code in (408, 422, 500, 502, 503, 504):
+    if code == 422:
+        detail = _http_error_detail(body)
+        message = f"HTTP 422 {detail}".strip()
+        if _is_arctic_shift_timeout_422(url, body):
+            raise RetryableError(message, "transient", headers)
+        raise FatalBackendError(message)
+    if code in (408, 500, 502, 503, 504):
         raise RetryableError(f"HTTP {code} {_snip(body)}".strip(), "transient", headers)
     if 400 <= code < 500:
         raise FatalBackendError(f"HTTP {code} {_snip(body)}".strip())
@@ -482,7 +536,8 @@ def _classify_status(url: str, code: int, body: str, headers) -> None:
 
 def fetch_json(url: str, retries: int = RETRIES):
     """GET JSON. Retry 429s against the rate-limit header and transient errors
-    with jitter. 400/404 and other client errors fail on the first response.
+    with jitter. Only Arctic Shift's recognized 422 query-timeout message is
+    retried; other 422s, 400/404, and other client errors fail immediately.
     Does not sleep after the attempt that gives up.
 
     Transport goes through pooled keep-alive connections; pacing is a shared
@@ -1043,7 +1098,10 @@ def _timeout_error(exc: BaseException) -> bool:
     ``limit``. Retrying the identical heavy page does not.
     """
     text = str(exc).lower()
-    return "422" in text or "timeout" in text or "timed out" in text
+    if re.search(r"\bhttp\s+422\b", text):
+        normalized = re.sub(r"\s+", " ", text)
+        return "timeout. maybe slow down a bit" in normalized
+    return "timeout" in text or "timed out" in text
 
 
 def _enqueue_replies(comment: dict, queue: deque) -> None:

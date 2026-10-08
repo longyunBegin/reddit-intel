@@ -229,6 +229,68 @@ class RedditIntelTest(unittest.TestCase):
         # attempt 0 -> 1s, attempt 1 -> 2s, uniform patched to the high end
         self.assertEqual(self.slept, [1.0, 2.0])
 
+    def test_known_arctic_shift_422_timeout_retries_with_bounded_backoff(self):
+        net = ScriptedHttp([
+            http_reply(
+                422,
+                '{"error":"Timeout. Maybe slow down a bit"}',
+                {"X-RateLimit-Reset": "40", "Retry-After": "60"},
+            ),
+            http_reply(422, '{"error":"Timeout. Maybe slow down a bit"}'),
+            http_reply(422, '{"error":"Timeout. Maybe slow down a bit"}'),
+        ])
+        mod._http_get = net
+        with self.assertRaises(mod.BackendError):
+            mod.fetch_json("https://arctic-shift.photon-reddit.com/x", retries=3)
+        self.assertEqual(len(net.urls), 3)  # three total attempts, two retries
+        self.assertEqual(self.slept, [1.0, 2.0])
+
+    def test_unrecognized_422_fails_fast_with_bounded_redacted_context(self):
+        secret = "very-secret-value-123"
+        basic_secret = "basic-credential-value-456"
+        body = json.dumps({
+            "error": (
+                f"invalid timeout parameter; access_token={secret}; "
+                f"Authorization: Basic {basic_secret} " + "x" * 1000
+            ),
+        })
+        net = ScriptedHttp([
+            http_reply(
+                422,
+                body,
+                {"X-RateLimit-Reset": "40", "Retry-After": "60"},
+            ),
+            http_reply(200, {"data": []}),
+        ])
+        mod._http_get = net
+        with self.assertRaises(mod.FatalBackendError) as ctx:
+            mod.fetch_json(
+                "https://arctic-shift.photon-reddit.com/x", retries=3
+            )
+        message = str(ctx.exception)
+        self.assertIn("invalid timeout parameter", message)
+        self.assertIn("access_token=[redacted]", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(basic_secret, message)
+        self.assertIn("authorization=[redacted]", message.lower())
+        self.assertLessEqual(len(message), 190)
+        self.assertEqual(len(net.urls), 1)
+        self.assertEqual(self.slept, [])
+
+    def test_unrecognized_422_does_not_shrink_search_page(self):
+        net = ScriptedHttp([
+            http_reply(422, '{"error":"invalid timeout parameter"}'),
+            http_reply(200, {"data": []}),
+        ])
+        mod._http_get = net
+        backend = mod.ArcticShiftBackend()
+        with self.assertRaises(mod.FatalBackendError):
+            backend.search_window("", "stocks", 1_000)
+        self.assertEqual(len(net.urls), 1)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(net.urls[0]).query)
+        self.assertEqual(query["limit"], [str(mod.PAGE_SIZE)])
+        self.assertEqual(self.slept, [])
+
     def test_pullpush_refusal_is_not_retried(self):
         net = ScriptedHttp([
             http_reply(
