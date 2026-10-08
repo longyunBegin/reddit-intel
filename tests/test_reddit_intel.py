@@ -9,6 +9,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 import urllib.parse
@@ -72,10 +73,13 @@ class RedditIntelTest(unittest.TestCase):
     def setUp(self):
         self._saved = {
             "pages": mod.MAX_WINDOW_POSTS,
+            "page_size": mod.PAGE_SIZE,
             "sleep": mod.time.sleep,
             "uniform": mod.random.uniform,
             "pacer": mod._PACER,
             "http_get": mod._http_get,
+            "fetch_json": mod.fetch_json,
+            "time_slices": mod._time_slices,
             "search": mod.ArcticShiftBackend.search_window,
             "count": mod.ArcticShiftBackend.count_comments,
             "cache_env": os.environ.get("REDDIT_INTEL_CACHE"),
@@ -90,10 +94,13 @@ class RedditIntelTest(unittest.TestCase):
 
     def tearDown(self):
         mod.MAX_WINDOW_POSTS = self._saved["pages"]
+        mod.PAGE_SIZE = self._saved["page_size"]
         mod.time.sleep = self._saved["sleep"]
         mod.random.uniform = self._saved["uniform"]
         mod._PACER = self._saved["pacer"]
         mod._http_get = self._saved["http_get"]
+        mod.fetch_json = self._saved["fetch_json"]
+        mod._time_slices = self._saved["time_slices"]
         mod.ArcticShiftBackend.search_window = self._saved["search"]
         mod.ArcticShiftBackend.count_comments = self._saved["count"]
         if self._saved["cache_env"] is None:
@@ -654,6 +661,55 @@ class RedditIntelTest(unittest.TestCase):
         # Slices are contiguous and ordered newest-first.
         for (lo_a, hi_a), (lo_b, hi_b) in zip(slices, slices[1:]):
             self.assertEqual(lo_a, hi_b)
+
+    def test_parallel_browse_reserves_shared_scan_budget(self):
+        mod.MAX_WINDOW_POSTS = 8
+        mod.PAGE_SIZE = 4
+        mod._time_slices = lambda _after, _now: [(90, None), (80, 90), (70, 80)]
+        barrier = threading.Barrier(3)
+
+        def fetch(url, **_kwargs):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            if query.get("query") == ["needle"]:
+                return {"data": []}
+            try:
+                barrier.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                # A correctly reserved budget allows only two of the three
+                # slices to have a request in flight at once.
+                pass
+            lower = int(query["after"][0])
+            rows = [
+                raw_post(
+                    f"slice-{lower}-{index}", lower + 4 - index,
+                    title="needle", sub="stocks",
+                )
+                for index in range(mod.PAGE_SIZE)
+            ]
+            return {"data": rows}
+
+        mod.fetch_json = fetch
+        result = mod.gather_posts(["needle"], ["stocks"], 70, "arctic-shift", 100)
+        self.assertEqual(len(result.raw), 8)
+        self.assertTrue(result.truncated)
+
+    def test_digest_labels_comment_scope_and_pending_snapshot(self):
+        text = mod.render_digest(
+            "earnings",
+            [{
+                "num_comments": 3,
+                "score_status": "pending",
+                "comments_source": "archive",
+                "subreddit": "stocks",
+                "title": "Example",
+                "score": 1,
+                "created": "2026-10-08T00:00:00Z",
+            }],
+            "24h",
+            ["stocks"],
+        )
+        self.assertIn("Comments (archive snapshots; not a query-wide or live total", text)
+        self.assertIn("1 pending post(s) may be undercounted): 3", text)
 
     def test_removed_posts_dropped_by_default(self):
         now = 1_800_000_000.0

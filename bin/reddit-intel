@@ -1086,12 +1086,17 @@ class ArcticShiftBackend:
         page_limit = PAGE_SIZE
         shrinks = 0
         requests = 0
-        while (requests < MAX_PAGE_REQUESTS and len(out) < MAX_WINDOW_POSTS
-               and not (budget is not None and budget.exhausted)):
+        while requests < MAX_PAGE_REQUESTS and len(out) < MAX_WINDOW_POSTS:
+            requested_limit = min(page_limit, MAX_WINDOW_POSTS - len(out))
+            reservation = requested_limit
+            if budget is not None:
+                reservation = budget.reserve(requested_limit)
+                if reservation <= 0:
+                    return out, True
             params: dict[str, str | int] = {
                 "subreddit": subreddit,
                 "sort": "desc",
-                "limit": page_limit,
+                "limit": reservation,
                 "after": format_epoch(after_utc),
                 "fields": POST_FIELDS,
             }
@@ -1106,21 +1111,31 @@ class ArcticShiftBackend:
                 # refused as too heavy.
                 data = self._fetch(url, retries=2)
             except BackendError as exc:
-                if (not _timeout_error(exc)) or page_limit <= 25 or shrinks >= 3:
+                if budget is not None:
+                    budget.settle(reservation, 0)
+                if (not _timeout_error(exc)) or reservation <= 25 or shrinks >= 3:
                     raise
-                smaller = max(25, page_limit // 2)
+                smaller = max(25, reservation // 2)
                 write_err(
-                    f"<!-- note: Arctic Shift timed out at limit={page_limit}; "
+                    f"<!-- note: Arctic Shift timed out at limit={reservation}; "
                     f"retrying this page at limit={smaller} -->"
                 )
                 page_limit = smaller
                 shrinks += 1
                 continue
+            except BaseException:
+                if budget is not None:
+                    budget.settle(reservation, 0)
+                raise
             requests += 1
             batch = data.get("data") if isinstance(data, dict) else None
             if not isinstance(batch, list):
+                if budget is not None:
+                    budget.settle(reservation, 0)
                 raise BackendError("unexpected posts payload from Arctic Shift")
             if not batch:
+                if budget is not None:
+                    budget.settle(reservation, 0)
                 break
             oldest: float | None = None
             new_count = 0
@@ -1140,14 +1155,16 @@ class ArcticShiftBackend:
                 pid = str(raw.get("id") or "").removeprefix("t3_").strip()
                 if not pid or pid in seen:
                     continue
+                if new_count >= reservation:
+                    continue
                 seen.add(pid)
                 new_count += 1
                 out.append(raw)
-            if budget is not None and new_count:
-                budget.take(new_count)
+            if budget is not None:
+                budget.settle(reservation, new_count)
             if oldest is None:
                 break
-            page_full = len(batch) >= page_limit
+            page_full = len(batch) >= reservation
             if not page_full or reached_start or oldest <= after_utc:
                 break
             if new_count == 0:
@@ -1361,17 +1378,42 @@ class _ScanBudget:
     """
 
     def __init__(self, total: int):
-        self._remaining = total
-        self._lock = threading.Lock()
+        self._remaining = max(0, total)
+        self._in_flight = 0
+        self._condition = threading.Condition()
 
-    def take(self, n: int) -> None:
-        with self._lock:
-            self._remaining = max(0, self._remaining - n)
+    def reserve(self, n: int) -> int:
+        """Atomically reserve up to n result slots before starting a page.
+
+        If other requests currently hold every remaining slot, wait for them
+        to settle so short pages can release unused capacity to this slice.
+        """
+        if n <= 0:
+            return 0
+        with self._condition:
+            while self._remaining <= 0 and self._in_flight > 0:
+                self._condition.wait()
+            reserved = min(n, self._remaining)
+            if reserved:
+                self._remaining -= reserved
+                self._in_flight += 1
+            return reserved
+
+    def settle(self, reserved: int, used: int) -> None:
+        """Commit used result slots and return any unused reservation."""
+        if reserved < 0 or used < 0 or used > reserved:
+            raise ValueError("invalid scan budget settlement")
+        with self._condition:
+            self._remaining += reserved - used
+            self._in_flight -= 1
+            if self._in_flight < 0:
+                raise RuntimeError("scan budget reservation settled more than once")
+            self._condition.notify_all()
 
     @property
     def exhausted(self) -> bool:
-        with self._lock:
-            return self._remaining <= 0
+        with self._condition:
+            return self._remaining <= 0 and self._in_flight == 0
 
 
 def _merge_alias_rows(per_alias: list[list[dict]]) -> list[dict]:
@@ -1709,11 +1751,27 @@ def render_digest(query: str, posts: list[dict], since: str, subs: list[str]) ->
     if not posts:
         return f'_no posts found in {where} since {since}_'
     total_comments = sum(safe_int(post.get("num_comments"), 0) for post in posts)
+    live_posts = [post for post in posts if post.get("comments_source") == "live"]
+    archive_posts = [post for post in posts if post.get("comments_source") != "live"]
+    pending_archive = sum(
+        1 for post in archive_posts if post.get("score_status") == "pending"
+    )
+    capped_live = any(post.get("comments_capped") for post in live_posts)
+    if archive_posts:
+        count_note = "archive snapshots; not a query-wide or live total"
+        if pending_archive:
+            count_note += f"; {pending_archive} pending post(s) may be undercounted"
+        if live_posts:
+            count_note += "; includes live counts"
+    elif capped_live:
+        count_note = "live lower bounds; returned posts only"
+    else:
+        count_note = "live counts; returned posts only"
     sub_names = sorted({post["subreddit"] for post in posts if post.get("subreddit")})
     lines = [
         f'# Reddit digest: "{query}" (since {since})',
         (
-            f"- Posts: {len(posts)} | Comments: {total_comments} | "
+            f"- Posts: {len(posts)} | Comments ({count_note}): {total_comments} | "
             f"Subs: {', '.join('r/' + name for name in sub_names)}"
         ),
         "",
