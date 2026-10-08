@@ -2,481 +2,1522 @@
 """
 reddit-intel: token-efficient Reddit intelligence CLI, built for LLM agents.
 
-Fetches Reddit discussions through free community archives (no API key needed)
-and compresses them *before* they reach the agent's context:
-
-  1. field allowlist   - keep 8 fields, drop 30+ noise fields        (~60% cut)
-  2. excerpt truncate  - body cut at word boundary, default 200 chars
-  3. server-side rank  - score x time-decay, return top N only
-  4. compact render    - markdown table instead of repeated-key JSON (~35% cut)
-  5. progressive depth - search -> comments -> digest, agent drills as needed
-
-Typical saving: 100 raw posts (~50k tokens) -> 10 compact rows (~1k tokens).
-
-Backends (auto-fallback):
-  - Arctic Shift  https://arctic-shift.photon-reddit.com  (primary)
-  - PullPush      https://api.pullpush.io                  (fallback)
+Fetches Reddit discussions through Arctic Shift (no API key) and compresses
+them before they reach the agent's context.
 
 Exit codes: 0 ok, 1 usage error, 2 all backends failed. Never prompts.
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime
 import json
+import os
+import pathlib
+import random
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 
-VERSION = "0.1.0"
-USER_AGENT = f"reddit-intel/{VERSION} (token-efficient agent tool; contact: github.com/longyunBegin/reddit-intel)"
-REQUEST_TIMEOUT = 25
-PACE_SECONDS = 1.0  # be polite to volunteer-run archives
+VERSION = "0.2.0"
+USER_AGENT = (
+    f"reddit-intel/{VERSION} (token-efficient agent tool; "
+    "contact: github.com/longyunBegin/reddit-intel)"
+)
+REQUEST_TIMEOUT = 30
+# Minimum gap between archive requests. Engagement counts use a slower pace.
+PACE_SECONDS = 1.0
+ENGAGEMENT_PACE_SECONDS = 1.5
+RETRIES = 3
+# 429 waits honor X-RateLimit-Reset, but never longer than this.
+# Observed resets on real 429s were ~25-43s; a cap avoids a bad header
+# parking the process for minutes.
+RATE_LIMIT_CAP = 45.0
+TRANSIENT_BACKOFF_CAP = 20.0
 
 ARCTIC_BASE = "https://arctic-shift.photon-reddit.com"
 PULLPUSH_BASE = "https://api.pullpush.io"
 
+# Posts younger than this still carry the creation snapshot: score is usually 1
+# and num_comments is usually 0. Arctic Shift backfills those fields after
+# roughly 36 hours. Comments themselves are ingested near real time.
+BACKFILL_SECONDS = 36 * 3600
+# Comments-per-hour uses this floor so a minutes-old post cannot explode the rate.
+CPH_MIN_AGE_HOURS = 0.25
+
+PAGE_SIZE = 100
+# 1000 posts per subreddit, then the window is reported truncated.
+MAX_WINDOW_POSTS = 1000
+# Safety cap on successful pages. Shrinking the page after a timeout (100 -> 50
+# -> 25) still stops at MAX_WINDOW_POSTS, not at a fixed page count.
+MAX_PAGE_REQUESTS = 40
+POST_FIELDS = "id,title,subreddit,score,num_comments,created_utc,selftext"
+
+COMMENT_PAGE_SIZE = 100
+COMMENT_MAX_PAGES = 3  # live counts are exact up to 300, then a lower bound
+
+ENGAGEMENT_TOP_DEFAULT = 8
+ENGAGEMENT_TOP_MAX = 12
+CACHE_TTL_SECONDS = 15 * 60
+CACHE_MAX_ENTRIES = 200
+
 _last_request_ts = 0.0
+
+SUBS_ERROR = (
+    "error: --subs is required (example: --subs stocks,investing). "
+    "Arctic Shift returns an empty 200 for subreddit=all and returns 400 "
+    "for a full-text query with no subreddit, so omitting --subs is not "
+    "'no discussion'."
+)
 
 
 # --------------------------------------------------------------------------
-# HTTP helper
+# Errors and HTTP
 # --------------------------------------------------------------------------
 
 class BackendError(Exception):
-    pass
+    """A backend failed. FatalBackendError must not be retried."""
 
 
-def fetch_json(url: str, retries: int = 3) -> dict | list:
-    """GET url, return parsed JSON. Retries transient failures with backoff.
+class FatalBackendError(BackendError):
+    """Client error or a hard refusal. Raised on the first response."""
 
-    Arctic Shift / PullPush are volunteer-run; 422/429/5xx flakes are common.
-    Raises BackendError only after retries are exhausted.
+
+class RetryableError(BackendError):
+    def __init__(self, message: str, kind: str, headers=None):
+        super().__init__(message)
+        # kind is "ratelimit" (HTTP 429) or "transient" (422/5xx/network).
+        self.kind = kind
+        self.headers = headers
+
+
+def configure_stdio() -> None:
+    """Don't crash on GBK consoles when a post title contains a character the
+    console encoding cannot represent. Our own chrome is ASCII; this is the
+    safety net for Reddit text."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            continue
+
+
+def _write(stream, text: str) -> None:
+    data = text + "\n"
+    try:
+        stream.write(data)
+        stream.flush()
+    except UnicodeEncodeError:
+        enc = getattr(stream, "encoding", None) or "utf-8"
+        safe = data.encode(enc, errors="replace")
+        buf = getattr(stream, "buffer", None)
+        if buf is not None:
+            buf.write(safe)
+            buf.flush()
+            return
+        stream.write(safe.decode(enc, errors="replace"))
+        stream.flush()
+
+
+def write_out(text: str) -> None:
+    _write(sys.stdout, text)
+
+
+def write_err(text: str) -> None:
+    _write(sys.stderr, text)
+
+
+def _snip(text: str, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _header(headers, name: str) -> str | None:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = getter(name)
+    if value is None:
+        value = getter(name.lower())
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _as_float(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _delay_from_reset_value(val: float) -> float:
+    """Seconds until the caller may retry.
+
+    Arctic Shift sends X-RateLimit-Reset as small integers (seconds) and
+    X-RateLimit-Reset-At as epoch milliseconds. A value past one hour is
+    treated as an epoch so a timestamp stuffed into the wrong header cannot
+    turn into a multi-year sleep; the caller still caps the result.
+    """
+    if val < 0:
+        return 0.0
+    if val <= 3600:
+        return val
+    if val > 1e12:
+        return max(0.0, (val / 1000.0) - time.time())
+    if val > 1e9:
+        return max(0.0, val - time.time())
+    return val
+
+
+def rate_limit_seconds(headers) -> float | None:
+    """Seconds the server asked us to wait, or None if it didn't say.
+
+    Prefer X-RateLimit-Reset (documented as seconds until reset). Fall back
+    to Retry-After, then X-RateLimit-Reset-At.
+    """
+    direct = _as_float(_header(headers, "X-RateLimit-Reset"))
+    if direct is not None:
+        return _delay_from_reset_value(direct)
+    retry_after = _as_float(_header(headers, "Retry-After"))
+    if retry_after is not None:
+        return _delay_from_reset_value(retry_after)
+    reset_at = _as_float(_header(headers, "X-RateLimit-Reset-At"))
+    if reset_at is None:
+        return None
+    if reset_at > 1e12:
+        reset_at = reset_at / 1000.0
+    return max(0.0, reset_at - time.time())
+
+
+def retry_delay(kind: str, attempt: int, headers) -> float:
+    """Sleep before another attempt. Not called after the final failure.
+
+    HTTP 429 waits for X-RateLimit-Reset (capped). Jitter is added only after
+    that deadline so we never retry early.
+
+    HTTP 422 / 5xx / network errors use jittered exponential backoff and
+    ignore X-RateLimit-Reset. That header is attached to ordinary 200s as
+    well, and a request sent immediately after an Arctic Shift 422 Timeout
+    succeeds — the 422 is a slow query, not a hold.
+    """
+    if attempt < 0:
+        attempt = 0
+    if kind == "ratelimit":
+        secs = rate_limit_seconds(headers)
+        if secs is None:
+            secs = min(TRANSIENT_BACKOFF_CAP, 5.0 * (2 ** attempt))
+            return min(RATE_LIMIT_CAP, secs * random.uniform(0.5, 1.0))
+        wait = min(RATE_LIMIT_CAP, max(0.0, secs))
+        room = max(0.0, RATE_LIMIT_CAP - wait)
+        jitter = random.uniform(0.0, min(0.75, room))
+        return wait + jitter
+    base = min(TRANSIENT_BACKOFF_CAP, 1.0 * (2 ** attempt))
+    return min(RATE_LIMIT_CAP, base * random.uniform(0.5, 1.0))
+
+
+def pullpush_refusal(url: str, code: int, body: str) -> str | None:
+    """PullPush blocks agent clients. Don't retry that."""
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if not host.endswith("pullpush.io"):
+        return None
+    low = body.lower()
+    if "does not provide free scraping" in low or "scraping resources for agents" in low:
+        return (
+            "PullPush does not provide free scraping for agents "
+            f"(HTTP {code}). It is not used unless you pass --backend pullpush."
+        )
+    if "<html" in low or "<!doctype" in low:
+        return (
+            f"PullPush returned HTTP {code} HTML instead of JSON. "
+            "Automatic fallback is disabled; --backend pullpush is opt-in and "
+            "currently blocks this client."
+        )
+    if code in (401, 403, 429):
+        detail = _snip(body) or "request refused"
+        return (
+            f"PullPush HTTP {code}: {detail}. "
+            "Automatic fallback is disabled."
+        )
+    return None
+
+
+def _classify_status(url: str, code: int, body: str, headers) -> None:
+    """Raise FatalBackendError or RetryableError for an HTTP error status."""
+    refusal = pullpush_refusal(url, code, body)
+    if refusal:
+        raise FatalBackendError(refusal)
+    if code == 429:
+        raise RetryableError(f"HTTP 429 {_snip(body)}".strip(), "ratelimit", headers)
+    if code in (408, 422, 500, 502, 503, 504):
+        raise RetryableError(f"HTTP {code} {_snip(body)}".strip(), "transient", headers)
+    if 400 <= code < 500:
+        raise FatalBackendError(f"HTTP {code} {_snip(body)}".strip())
+    raise RetryableError(f"HTTP {code} {_snip(body)}".strip(), "transient", headers)
+
+
+def fetch_json(url: str, retries: int = RETRIES, pace: float | None = None):
+    """GET JSON. Retry 429s against the rate-limit header and transient errors
+    with jitter. 400/404 and other client errors fail on the first response.
+    Does not sleep after the attempt that gives up.
     """
     global _last_request_ts
-    last_err: Exception | None = None
+    if retries < 1:
+        raise BackendError("retries must be >= 1")
+    gap = PACE_SECONDS if pace is None else max(0.0, pace)
+    last_err: BackendError | None = None
     for attempt in range(retries):
-        wait = PACE_SECONDS - (time.monotonic() - _last_request_ts)
-        if wait > 0:
-            time.sleep(wait)
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        waited = gap - (time.monotonic() - _last_request_ts)
+        if waited > 0:
+            time.sleep(waited)
+        _last_request_ts = time.monotonic()
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        )
         try:
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                if resp.status != 200:
-                    raise BackendError(f"HTTP {resp.status} for {url}")
-                _last_request_ts = time.monotonic()
-                return json.loads(resp.read().decode("utf-8"))
-        except BackendError as e:
-            last_err = e
-        except Exception as e:  # network, timeout, bad JSON
-            last_err = BackendError(f"{type(e).__name__}: {e} for {url}")
-        time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff before retry
-    raise last_err if isinstance(last_err, BackendError) else BackendError(str(last_err))
+                raw_bytes = resp.read()
+                status = getattr(resp, "status", 200) or 200
+                headers = getattr(resp, "headers", None)
+                if status != 200:
+                    body = raw_bytes.decode("utf-8", "replace") if raw_bytes else ""
+                    _classify_status(url, int(status), body, headers)
+                try:
+                    parsed = json.loads(raw_bytes.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError) as exc:
+                    raise RetryableError(f"bad JSON: {exc}", "transient", None) from exc
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("data") is None
+                    and isinstance(parsed.get("error"), str)
+                ):
+                    message = parsed["error"]
+                    if "timeout" in message.lower():
+                        raise RetryableError(message, "transient", headers)
+                    raise FatalBackendError(message)
+                return parsed
+        except FatalBackendError:
+            raise
+        except RetryableError as exc:
+            last_err = exc
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            try:
+                _classify_status(url, int(exc.code), body, exc.headers)
+            except FatalBackendError:
+                raise
+            except RetryableError as classified:
+                last_err = classified
+        except urllib.error.URLError as exc:
+            last_err = RetryableError(f"URLError: {exc.reason}", "transient", None)
+        except (TimeoutError, OSError) as exc:
+            last_err = RetryableError(f"{type(exc).__name__}: {exc}", "transient", None)
+        if last_err is None:
+            raise BackendError("request failed")
+        if attempt + 1 >= retries:
+            raise BackendError(str(last_err))
+        delay = retry_delay(last_err.kind, attempt, getattr(last_err, "headers", None))
+        if last_err.kind == "ratelimit" or delay >= 5:
+            write_err(
+                f"<!-- note: {last_err.kind} on attempt {attempt + 1}/{retries}, "
+                f"waiting {delay:.1f}s -->"
+            )
+        time.sleep(delay)
+    raise BackendError(str(last_err) if last_err else "request failed")
 
 
 # --------------------------------------------------------------------------
-# Normalization: raw post -> 8-field compact dict
+# Text, time, posts
 # --------------------------------------------------------------------------
+
+def safe_int(value, default: int = 0) -> int:
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 
 def _excerpt(text: str, max_chars: int) -> str:
-    text = re.sub(r"\s+", " ", (text or "")).strip()
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if max_chars < 1 or not text:
+        return ""
     if len(text) <= max_chars:
         return text
     cut = text[:max_chars].rsplit(" ", 1)[0]
-    return (cut or text[:max_chars]) + "…"
+    # A single token longer than the budget would otherwise collapse to empty.
+    if not cut or len(cut) < max(1, max_chars // 2):
+        cut = text[:max_chars]
+    return cut + "..."
 
 
 def _iso(ts) -> str:
     try:
-        return datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (TypeError, ValueError):
+        moment = datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
         return ""
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def normalize_post(raw: dict, excerpt_chars: int) -> dict:
-    """Field allowlist: keep 8 fields, drop everything else."""
-    pid = str(raw.get("id") or "").removeprefix("t3_")
-    permalink = raw.get("permalink") or f"/r/{raw.get('subreddit')}/comments/{pid}/"
-    return {
+def format_epoch(ts: float) -> str:
+    """Integer epoch seconds for Arctic Shift `after` / `before`.
+
+    The API accepts epoch seconds, epoch milliseconds, and ISO dates. A
+    fractional second such as ``time.time() - 86400`` is rejected with
+    HTTP 400 (``'after' must be a valid date``). Flooring widens the server
+    window by less than a second; callers still drop rows older than the
+    exact instant.
+    """
+    if ts <= 0:
+        return "0"
+    return str(int(ts))
+
+
+def created_epoch(iso: str) -> float | None:
+    if not iso:
+        return None
+    try:
+        parsed = datetime.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def score_status_for(iso: str, now_ts: float) -> str:
+    """`pending` until Arctic Shift's ~36h score/num_comments backfill."""
+    ts = created_epoch(iso)
+    if ts is None:
+        return "pending"
+    if (now_ts - ts) < BACKFILL_SECONDS:
+        return "pending"
+    return "backfilled"
+
+
+def post_age_hours(post: dict, now_ts: float) -> float:
+    ts = created_epoch(post.get("created") or "")
+    if ts is None:
+        return 24.0
+    return max(0.0, (now_ts - ts) / 3600.0)
+
+
+def removal_marker(text: object) -> str | None:
+    if not isinstance(text, str):
+        return None
+    token = text.strip().lower()
+    if token in {"[removed]", "[deleted]"}:
+        return token
+    return None
+
+
+def reddit_url(raw: dict, pid: str, sub: str) -> str:
+    permalink = raw.get("permalink")
+    if isinstance(permalink, str):
+        permalink = permalink.strip()
+        if permalink.startswith("/"):
+            return "https://www.reddit.com" + permalink
+        if permalink.startswith("https://") or permalink.startswith("http://"):
+            return permalink
+    # A missing subreddit must not become the literal path segment "None".
+    if sub and pid:
+        return f"https://www.reddit.com/r/{sub}/comments/{pid}/"
+    if pid:
+        return f"https://www.reddit.com/comments/{pid}/"
+    return ""
+
+
+def _clean_subreddit(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    name = value.strip()
+    if name.lower() in {"", "none", "null"}:
+        return ""
+    return name
+
+
+def normalize_post(raw: dict, excerpt_chars: int, now_ts: float) -> dict | None:
+    """Allowlist fields. Return None when the post has no readable title.
+
+    A body of [removed]/[deleted] is flagged and the excerpt is cleared.
+    A title of [removed]/[deleted] is dropped: there is nothing to rank.
+    """
+    if not isinstance(raw, dict):
+        return None
+    pid = str(raw.get("id") or "").removeprefix("t3_").strip()
+    if not pid:
+        return None
+    title = re.sub(r"\s+", " ", str(raw.get("title") or "")).strip()
+    selftext = raw.get("selftext")
+    selftext_s = selftext if isinstance(selftext, str) else ""
+    if removal_marker(title):
+        return None
+    body_removed = removal_marker(selftext_s)
+    sub = _clean_subreddit(raw.get("subreddit"))
+    created = _iso(raw.get("created_utc"))
+    post = {
         "id": pid,
-        "title": re.sub(r"\s+", " ", str(raw.get("title") or "")).strip(),
-        "subreddit": str(raw.get("subreddit") or ""),
-        "score": int(raw.get("score") or 0),
-        "num_comments": int(raw.get("num_comments") or 0),
-        "created": _iso(raw.get("created_utc")),
-        "url": f"https://www.reddit.com{permalink}" if permalink.startswith("/") else str(permalink),
-        "excerpt": _excerpt(str(raw.get("selftext") or ""), excerpt_chars),
+        "title": title,
+        "subreddit": sub,
+        "score": safe_int(raw.get("score"), 0),
+        "num_comments": safe_int(raw.get("num_comments"), 0),
+        "score_status": score_status_for(created, now_ts),
+        "created": created,
+        "url": reddit_url(raw, pid, sub),
+        "excerpt": "" if body_removed else _excerpt(selftext_s, excerpt_chars),
     }
+    if body_removed:
+        post["removed"] = True
+    return post
 
 
 def normalize_comment(raw: dict, max_chars: int) -> dict:
+    author = raw.get("author")
+    if not isinstance(author, str) or not author.strip():
+        author_s = "[deleted]"
+    else:
+        author_s = author.strip()
+        if removal_marker(author_s):
+            author_s = "[deleted]"
+    body = raw.get("body")
+    body_s = body if isinstance(body, str) else ""
     return {
         "id": str(raw.get("id") or ""),
-        "author": str(raw.get("author") or "[deleted]"),
-        "score": int(raw.get("score") or 0),
+        "author": author_s,
+        "score": safe_int(raw.get("score"), 0),
         "created": _iso(raw.get("created_utc")),
-        "body": _excerpt(str(raw.get("body") or ""), max_chars),
+        "body": _excerpt(body_s, max_chars),
     }
 
 
-def rank_posts(posts: list[dict], now_ts: float) -> list[dict]:
-    """Gravity ranking: score / (age_hours + 2) ^ 1.5. Deterministic."""
+def query_terms(query: str) -> list[str]:
+    """Terms that must all match. Quoted phrases stay one term.
 
-    def gravity(p: dict) -> float:
-        try:
-            age_h = max(0.0, (now_ts - datetime.datetime.strptime(
-                p["created"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()) / 3600)
-        except (ValueError, KeyError):
-            age_h = 24.0
-        return p["score"] / ((age_h + 2) ** 1.5)
+    Arctic Shift's `query` parameter already ANDs unquoted words. The browse
+    fallback has to do the same on the client; matching the whole phrase as
+    one substring drops ordinary multi-word queries.
+    """
+    text = (query or "").strip()
+    if not text:
+        return []
+    found = re.findall(r'"([^"]+)"|(\S+)', text)
+    terms: list[str] = []
+    for quoted, bare in found:
+        term = (quoted or bare).strip().lower()
+        if term:
+            terms.append(term)
+    return terms
 
-    return sorted(posts, key=gravity, reverse=True)
+
+def raw_haystack(raw: dict) -> str:
+    title = raw.get("title")
+    body = raw.get("selftext")
+    title_s = title if isinstance(title, str) else ""
+    body_s = body if isinstance(body, str) else ""
+    return f"{title_s}\n{body_s}".lower()
+
+
+def matches_terms(raw: dict, terms: list[str]) -> bool:
+    if not terms:
+        return True
+    hay = raw_haystack(raw)
+    return all(term in hay for term in terms)
+
+
+def gravity_score(post: dict, now_ts: float) -> float:
+    """score / (age_hours + 2) ^ 1.5. Meaningful once score is backfilled."""
+    age_h = post_age_hours(post, now_ts)
+    return post["score"] / ((age_h + 2.0) ** 1.5)
+
+
+def rank_key(post: dict, now_ts: float, engagement: bool) -> tuple:
+    created = created_epoch(post.get("created") or "") or 0.0
+    pid = post.get("id") or ""
+    if engagement:
+        # Tier 2: live comments/hour for young posts we measured, gravity for
+        # posts old enough to have a real score. Tier 1: young posts we did
+        # not measure (the engagement cap). Newer created wins ties.
+        if post.get("comments_source") == "live":
+            return (2, float(post.get("comments_per_hour") or 0.0), created, pid)
+        if post.get("score_status") != "pending":
+            return (2, gravity_score(post, now_ts), created, pid)
+        return (1, 0.0, created, pid)
+    return (gravity_score(post, now_ts), created, pid)
+
+
+def rank_posts(posts: list[dict], now_ts: float, engagement: bool = False) -> list[dict]:
+    return sorted(posts, key=lambda post: rank_key(post, now_ts, engagement), reverse=True)
 
 
 def dedup(posts: list[dict]) -> list[dict]:
     seen: set[str] = set()
-    out = []
-    for p in posts:
-        if p["id"] and p["id"] not in seen:
-            seen.add(p["id"])
-            out.append(p)
+    out: list[dict] = []
+    for post in posts:
+        pid = post.get("id") or ""
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        out.append(post)
     return out
+
+
+def select_engagement_candidates(posts: list[dict], now_ts: float, n: int) -> list[dict]:
+    """Up to n posts whose score is not backfilled yet.
+
+    If there are more than n, posts that already show a non-zero archive
+    comment count are kept first (rare before 36h, but it is real data).
+    The remaining slots are spread from the oldest young post to the newest
+    so the sample is not only the last few minutes of the window.
+    `now_ts` is part of the signature because callers select against the
+    same clock used to mark score_status; the mark is already on the post.
+    """
+    del now_ts  # score_status was computed with this clock; nothing else to do.
+    if n < 1:
+        return []
+    young = [post for post in posts if post.get("score_status") == "pending" and post.get("id")]
+    if len(young) <= n:
+        return list(young)
+    signaled = [post for post in young if safe_int(post.get("num_comments"), 0) > 0]
+    signaled.sort(
+        key=lambda post: (created_epoch(post.get("created") or "") or 0.0, post["id"]),
+        reverse=True,
+    )
+    chosen: list[dict] = []
+    seen: set[str] = set()
+    for post in signaled:
+        if post["id"] in seen:
+            continue
+        chosen.append(post)
+        seen.add(post["id"])
+        if len(chosen) >= n:
+            return chosen
+    pool = [post for post in young if post["id"] not in seen]
+    pool.sort(key=lambda post: (created_epoch(post.get("created") or "") or 0.0, post["id"]))
+    slots = n - len(chosen)
+    indexes: list[int] = []
+    if pool and slots > 0:
+        if slots == 1 or len(pool) == 1:
+            indexes = [len(pool) - 1]
+        else:
+            for i in range(slots):
+                indexes.append(round(i * (len(pool) - 1) / (slots - 1)))
+    for idx in indexes:
+        post = pool[idx]
+        if post["id"] in seen:
+            continue
+        chosen.append(post)
+        seen.add(post["id"])
+    if len(chosen) < n:
+        for post in reversed(pool):
+            if post["id"] in seen:
+                continue
+            chosen.append(post)
+            seen.add(post["id"])
+            if len(chosen) >= n:
+                break
+    return chosen
+
+
+def annotate_live_comments(post: dict, count: int, capped: bool, now_ts: float) -> None:
+    count = max(0, int(count))
+    post["num_comments"] = count
+    post["comments_source"] = "live"
+    if capped:
+        post["comments_capped"] = True
+    elif "comments_capped" in post:
+        del post["comments_capped"]
+    age_h = post_age_hours(post, now_ts)
+    denom = age_h if age_h > CPH_MIN_AGE_HOURS else CPH_MIN_AGE_HOURS
+    post["comments_per_hour"] = round(count / denom, 2)
+
+
+class EngagementCache:
+    """Short JSON cache of live comment counts, keyed by post id.
+
+    Repeat searches inside the TTL do not hit the comment endpoint again.
+    A corrupt or unreadable file is ignored. Write failures stay in memory.
+    """
+
+    def __init__(self, path: pathlib.Path | None, now_ts: float, ttl: float = CACHE_TTL_SECONDS):
+        self.path = path
+        self.now_ts = now_ts
+        self.ttl = ttl
+        self.posts: dict[str, dict] = {}
+        self.hits = 0
+        self._load()
+
+    def _load(self) -> None:
+        if self.path is None or not self.path.is_file():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        stored = raw.get("posts") if isinstance(raw, dict) else None
+        if not isinstance(stored, dict):
+            return
+        kept: dict[str, dict] = {}
+        for pid, row in stored.items():
+            if not isinstance(pid, str) or not isinstance(row, dict):
+                continue
+            try:
+                at = float(row["at"])
+                count = int(row["n"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if count < 0 or (self.now_ts - at) > self.ttl:
+                continue
+            kept[pid] = {"n": count, "capped": bool(row.get("capped")), "at": at}
+        if len(kept) > CACHE_MAX_ENTRIES:
+            newest = sorted(kept.items(), key=lambda item: item[1]["at"], reverse=True)
+            kept = dict(newest[:CACHE_MAX_ENTRIES])
+        self.posts = kept
+
+    def get(self, pid: str) -> tuple[int, bool] | None:
+        row = self.posts.get(pid)
+        if row is None:
+            return None
+        self.hits += 1
+        return int(row["n"]), bool(row["capped"])
+
+    def put(self, pid: str, count: int, capped: bool) -> None:
+        self.posts[pid] = {"n": int(count), "capped": bool(capped), "at": self.now_ts}
+        if len(self.posts) > CACHE_MAX_ENTRIES:
+            newest = sorted(self.posts.items(), key=lambda item: item[1]["at"], reverse=True)
+            self.posts = dict(newest[:CACHE_MAX_ENTRIES])
+        self._save()
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"v": 1, "posts": self.posts}
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError:
+            return
+
+
+def default_cache_path() -> pathlib.Path | None:
+    override = os.environ.get("REDDIT_INTEL_CACHE")
+    if override is not None:
+        if override.strip().lower() in {"", "-", "none", "off"}:
+            return None
+        return pathlib.Path(override)
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = pathlib.Path(xdg) if xdg else pathlib.Path.home() / ".cache"
+    return base / "reddit-intel" / "engagement.json"
+
+
+def measure_engagement(posts: list[dict], candidates: list[dict], counter, cache: EngagementCache, now_ts: float) -> tuple[int, int]:
+    """Attach live counts. counter(post_id) -> (count, capped) or BackendError.
+
+    Returns (measured, failed). One post's failure does not drop the search.
+    """
+    measured = 0
+    failed = 0
+    by_id = {post["id"]: post for post in posts if post.get("id")}
+    for cand in candidates:
+        post = by_id.get(cand.get("id") or "")
+        if post is None:
+            continue
+        cached = cache.get(post["id"])
+        if cached is not None:
+            annotate_live_comments(post, cached[0], cached[1], now_ts)
+            measured += 1
+            continue
+        try:
+            count, capped = counter(post["id"])
+        except BackendError:
+            failed += 1
+            continue
+        try:
+            count_i = int(count)
+        except (TypeError, ValueError):
+            failed += 1
+            continue
+        if count_i < 0:
+            failed += 1
+            continue
+        cache.put(post["id"], count_i, bool(capped))
+        annotate_live_comments(post, count_i, bool(capped), now_ts)
+        measured += 1
+    return measured, failed
 
 
 # --------------------------------------------------------------------------
 # Backends
 # --------------------------------------------------------------------------
 
+def _timeout_error(exc: BaseException) -> bool:
+    """True when Arctic Shift (or the socket) gave up on this query.
+
+    The API's own guidance for ``Timeout. Maybe slow down a bit`` is to lower
+    ``limit``. Retrying the identical heavy page does not.
+    """
+    text = str(exc).lower()
+    return "422" in text or "timeout" in text or "timed out" in text
+
+
+def _enqueue_replies(comment: dict, queue: deque) -> None:
+    replies = comment.get("replies")
+    if isinstance(replies, dict):
+        kids = replies.get("data", {}).get("children", [])
+        if isinstance(kids, list):
+            queue.extend(kids)
+    elif isinstance(replies, list):
+        queue.extend(replies)
+
+
 class ArcticShiftBackend:
     name = "arctic-shift"
 
-    def _paged(self, params: dict, limit: int) -> list[dict]:
-        """Page with `before` cursor until limit reached or exhausted."""
+    def __init__(self, fetch=None):
+        self._fetch = fetch or fetch_json
+
+    def search_window(self, query: str, subreddit: str, after_utc: float) -> tuple[list[dict], bool]:
+        """Posts with created_utc >= after_utc, newest first.
+
+        The server receives `after`, so the time window is not "the newest
+        limit*2 rows". Full pages continue with `before` set to the oldest
+        created_utc on that page. That cursor is exclusive: a live check on
+        r/wallstreetbets returned the next older page with zero id overlap.
+        A short page, a cursor that does not move, or the window start ends
+        the scan. Hitting MAX_WINDOW_POSTS (or the request cap) sets truncated.
+        A 422 timeout shrinks the page (100, then 50, then 25) instead of
+        repeating the same heavy request.
+        """
         out: list[dict] = []
-        before: int | None = None
-        while len(out) < limit:
-            p = dict(params)
-            p["limit"] = min(100, limit - len(out))
-            if before:
-                p["before"] = before
-            url = f"{ARCTIC_BASE}/api/posts/search?{urllib.parse.urlencode(p)}"
-            data = fetch_json(url)
-            batch = data.get("data", []) if isinstance(data, dict) else []
+        seen: set[str] = set()
+        before: float | None = None
+        page_limit = PAGE_SIZE
+        shrinks = 0
+        requests = 0
+        while requests < MAX_PAGE_REQUESTS and len(out) < MAX_WINDOW_POSTS:
+            params: dict[str, str | int] = {
+                "subreddit": subreddit,
+                "sort": "desc",
+                "limit": page_limit,
+                "after": format_epoch(after_utc),
+                "fields": POST_FIELDS,
+            }
+            if query:
+                params["query"] = query
+            if before is not None:
+                params["before"] = format_epoch(before)
+            url = f"{ARCTIC_BASE}/api/posts/search?{urllib.parse.urlencode(params)}"
+            try:
+                # One retry of this exact URL (warm-up), then shrink. The default
+                # 3 identical attempts just repeat a query the server already
+                # refused as too heavy.
+                data = self._fetch(url, retries=2)
+            except BackendError as exc:
+                if (not _timeout_error(exc)) or page_limit <= 25 or shrinks >= 3:
+                    raise
+                smaller = max(25, page_limit // 2)
+                write_err(
+                    f"<!-- note: Arctic Shift timed out at limit={page_limit}; "
+                    f"retrying this page at limit={smaller} -->"
+                )
+                page_limit = smaller
+                shrinks += 1
+                continue
+            requests += 1
+            batch = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(batch, list):
+                raise BackendError("unexpected posts payload from Arctic Shift")
             if not batch:
                 break
-            out.extend(batch)
-            try:
-                before = int(float(batch[-1].get("created_utc", 0)))
-            except (TypeError, ValueError):
+            oldest: float | None = None
+            new_count = 0
+            reached_start = False
+            for raw in batch:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    ts = float(raw.get("created_utc"))
+                except (TypeError, ValueError):
+                    continue
+                if oldest is None or ts < oldest:
+                    oldest = ts
+                if ts < after_utc:
+                    reached_start = True
+                    continue
+                pid = str(raw.get("id") or "").removeprefix("t3_").strip()
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                new_count += 1
+                out.append(raw)
+            if oldest is None:
                 break
-            if len(batch) < p["limit"]:
+            page_full = len(batch) >= page_limit
+            if not page_full or reached_start or oldest <= after_utc:
                 break
-        return out
+            if new_count == 0:
+                break
+            if before is not None and oldest >= before:
+                break
+            before = oldest
+        else:
+            # Hit the post cap or the request cap while the window was still open.
+            return out, True
+        return out, False
 
-    def search_posts(self, query: str, subreddit: str, limit: int, after_utc: float) -> list[dict]:
-        params = {"subreddit": subreddit, "sort": "desc", "sort_type": "created_utc"}
-        if query:
-            # NOTE: `query` (full-text over title+selftext) requires sort_type.
-            params["query"] = query
-        batch = self._paged(params, limit)
-        # client-side time filter (reliable even if server ignores `after`)
-        return [p for p in batch if float(p.get("created_utc") or 0) >= after_utc]
+    def count_comments(self, post_id: str) -> tuple[int, bool]:
+        """Live comment count via /api/comments/search?link_id=.
 
-    def browse_filter(self, query: str, subreddit: str, limit: int, after_utc: float) -> list[dict]:
-        """Last resort: browse latest posts, filter by keyword client-side.
-
-        Plain listing is the most reliable endpoint; fetch 5x to compensate
-        for filter losses.
+        Bodies are not downloaded (`fields=id,created_utc`). The tree endpoint
+        returns the same comments with full text; search pages of ids are
+        enough to count and much smaller. Returns (count, capped). When capped
+        is true the count is a lower bound of COMMENT_MAX_PAGES * page size.
         """
-        batch = self._paged({"subreddit": subreddit, "sort": "desc",
-                             "sort_type": "created_utc"}, limit * 5)
-        q = query.lower()
-        return [p for p in batch
-                if float(p.get("created_utc") or 0) >= after_utc
-                and q in ((p.get("title") or "") + " " + (p.get("selftext") or "")).lower()]
+        pid = post_id.removeprefix("t3_").strip()
+        if not pid:
+            raise BackendError("missing post id")
+        seen: set[str] = set()
+        total = 0
+        before: float | None = None
+        for _page in range(COMMENT_MAX_PAGES):
+            params: dict[str, str | int] = {
+                "link_id": pid,
+                "limit": COMMENT_PAGE_SIZE,
+                "sort": "desc",
+                "fields": "id,created_utc",
+            }
+            if before is not None:
+                params["before"] = format_epoch(before)
+            url = f"{ARCTIC_BASE}/api/comments/search?{urllib.parse.urlencode(params)}"
+            data = self._fetch(url, pace=ENGAGEMENT_PACE_SECONDS)
+            batch = data.get("data") if isinstance(data, dict) else None
+            if not isinstance(batch, list):
+                raise BackendError(f"unexpected comments payload for {pid}")
+            oldest: float | None = None
+            fresh = 0
+            for raw in batch:
+                if not isinstance(raw, dict):
+                    continue
+                cid = str(raw.get("id") or "")
+                if cid and cid in seen:
+                    continue
+                if cid:
+                    seen.add(cid)
+                fresh += 1
+                try:
+                    ts = float(raw.get("created_utc"))
+                except (TypeError, ValueError):
+                    ts = None
+                if ts is not None and (oldest is None or ts < oldest):
+                    oldest = ts
+            total += fresh
+            if len(batch) < COMMENT_PAGE_SIZE:
+                return total, False
+            if oldest is None:
+                return total, True
+            if before is not None and oldest >= before:
+                return total, True
+            before = oldest
+        return total, True
 
     def get_comments(self, post_id: str, limit: int) -> list[dict]:
-        pid = post_id.removeprefix("t3_")
-        url = (f"{ARCTIC_BASE}/api/comments/tree?link_id=t3_{pid}"
-               f"&limit={min(1000, max(limit * 5, 100))}")
-        data = fetch_json(url)
+        pid = post_id.removeprefix("t3_").strip()
+        if not pid:
+            raise BackendError("missing post id")
+        fetch_limit = min(1000, max(limit * 5, 100))
+        url = (
+            f"{ARCTIC_BASE}/api/comments/tree?link_id={urllib.parse.quote(pid)}"
+            f"&limit={fetch_limit}"
+        )
+        data = self._fetch(url)
         if isinstance(data, dict):
-            items = data.get("data") or data.get("comments") or []
+            items = data.get("data") if data.get("data") is not None else data.get("comments")
+        elif isinstance(data, list):
+            items = data
         else:
-            items = data if isinstance(data, list) else []
-        # unwrap Reddit listing envelope {"kind": "t1", "data": {...}} and
-        # flatten the tree breadth-first (top-level first)
+            raise BackendError(f"unexpected comment tree for {pid}")
+        if not isinstance(items, list):
+            raise BackendError(f"unexpected comment tree for {pid}")
         flat: list[dict] = []
-        queue = list(items)
+        queue: deque = deque(items)
         while queue:
-            node = queue.pop(0)
+            node = queue.popleft()
             if not isinstance(node, dict):
                 continue
-            c = node.get("data") if node.get("kind") in ("t1", "more") and isinstance(
-                node.get("data"), dict) else node
-            if node.get("kind") == "more":
-                continue  # collapsed branch placeholder, skip
-            flat.append(c)
-            replies = c.get("replies")
-            if isinstance(replies, dict):
-                kids = replies.get("data", {}).get("children", [])
-                queue.extend(kids)
-            elif isinstance(replies, list):
-                queue.extend(replies)
-        return sorted(flat, key=lambda c: int(c.get("score") or 0), reverse=True)[:limit]
+            kind = node.get("kind")
+            payload = node.get("data")
+            if kind in ("t1", "more") and isinstance(payload, dict):
+                comment = payload
+            else:
+                comment = node
+            if kind == "more":
+                continue
+            body = comment.get("body")
+            body_s = body if isinstance(body, str) else ""
+            if removal_marker(body_s):
+                _enqueue_replies(comment, queue)
+                continue
+            flat.append(comment)
+            _enqueue_replies(comment, queue)
+        flat.sort(key=lambda comment: safe_int(comment.get("score"), 0), reverse=True)
+        return flat[: max(0, limit)]
 
 
 class PullPushBackend:
+    """Explicit opt-in only. Not used by --backend auto.
+
+    PullPush answers agent clients with 429/403 and does not want to be a
+    scraping fallback. Requests still go through fetch_json, which fails that
+    refusal on the first response.
+    """
+
     name = "pullpush"
 
+    def __init__(self, fetch=None):
+        self._fetch = fetch or fetch_json
+
     def search_posts(self, query: str, subreddit: str, limit: int, after_utc: float) -> list[dict]:
-        # NOTE: /topic errors when `subreddit` is passed; query globally and
-        # filter client-side instead.
-        params = {"q": query or "*", "size": min(100, limit), "sort": "desc"}
+        params = {"q": query or "*", "size": min(100, max(1, limit)), "sort": "desc"}
         url = f"{PULLPUSH_BASE}/topic?{urllib.parse.urlencode(params)}"
-        data = fetch_json(url)
-        batch = data.get("data", []) if isinstance(data, dict) else []
+        data = self._fetch(url)
+        batch = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(batch, list):
+            raise BackendError("unexpected PullPush payload")
         want = subreddit.lower()
-        return [p for p in batch
-                if float(p.get("created_utc") or 0) >= after_utc
-                and (want in ("all", "*") or str(p.get("subreddit") or "").lower() == want)][:limit]
+        kept: list[dict] = []
+        for raw in batch:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                ts = float(raw.get("created_utc") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts < after_utc:
+                continue
+            if str(raw.get("subreddit") or "").lower() != want:
+                continue
+            kept.append(raw)
+            if len(kept) >= limit:
+                break
+        return kept
 
     def get_comments(self, post_id: str, limit: int) -> list[dict]:
-        pid = post_id.removeprefix("t3_")
-        params = {"link_id": f"t3_{pid}", "size": min(100, limit), "sort": "desc"}
+        pid = post_id.removeprefix("t3_").strip()
+        params = {"link_id": f"t3_{pid}", "size": min(100, max(1, limit)), "sort": "desc"}
         url = f"{PULLPUSH_BASE}/comment?{urllib.parse.urlencode(params)}"
-        data = fetch_json(url)
-        batch = data.get("data", []) if isinstance(data, dict) else []
-        return sorted(batch, key=lambda c: int(c.get("score") or 0), reverse=True)[:limit]
+        data = self._fetch(url)
+        batch = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(batch, list):
+            raise BackendError("unexpected PullPush comment payload")
+        visible = []
+        for raw in batch:
+            if not isinstance(raw, dict):
+                continue
+            body = raw.get("body")
+            if removal_marker(body if isinstance(body, str) else ""):
+                continue
+            visible.append(raw)
+        visible.sort(key=lambda comment: safe_int(comment.get("score"), 0), reverse=True)
+        return visible[: max(0, limit)]
 
 
-BACKENDS = {"arctic-shift": ArcticShiftBackend, "pullpush": PullPushBackend}
+@dataclasses.dataclass
+class GatherResult:
+    backend: str
+    raw: list[dict]
+    scanned: int
+    oldest: float | None
+    truncated: bool
+    notes: list[str]
 
 
-def with_fallback(backend_name: str, fn, *args):
-    """Try requested backend, fall back to the other one on failure.
-
-    Three-level search strategy lives in cmd_search/cmd_digest:
-      1. Arctic Shift full-text `query`   (best, but index flakes)
-      2. PullPush full-text `q`           (independent backend)
-      3. Arctic Shift browse + client-side keyword filter (always works)
-    """
-    order = [backend_name] if backend_name != "auto" else ["arctic-shift", "pullpush"]
-    if backend_name != "auto":
-        order.append("pullpush" if backend_name == "arctic-shift" else "arctic-shift")
-    errors = []
-    for name in order:
+def _consume(batch: list[dict], stats: dict) -> None:
+    for raw in batch:
+        if not isinstance(raw, dict):
+            continue
+        stats["scanned"] += 1
         try:
-            backend = BACKENDS[name]()
-            return backend, fn(backend, *args)
-        except BackendError as e:
-            errors.append(f"{name}: {e}")
-    raise BackendError(" | ".join(errors))
+            ts = float(raw.get("created_utc"))
+        except (TypeError, ValueError):
+            continue
+        if stats["oldest"] is None or ts < stats["oldest"]:
+            stats["oldest"] = ts
 
 
-# --------------------------------------------------------------------------
-# Time parsing
-# --------------------------------------------------------------------------
+def gather_posts(query: str, subs: list[str], after_utc: float, backend_name: str) -> GatherResult:
+    """Fetch the time window.
 
-def parse_since(s: str, now_ts: float) -> float:
-    s = s.strip().lower()
-    m = re.fullmatch(r"(\d+)\s*h", s)
-    if m:
-        return now_ts - int(m.group(1)) * 3600
-    m = re.fullmatch(r"(\d+)\s*d", s)
-    if m:
-        return now_ts - int(m.group(1)) * 86400
+    auto / arctic-shift never call PullPush. A full-text failure, or a query
+    that returns zero rows, runs the browse+keyword pass once — not twice
+    when that pass is also empty.
+    """
+    notes: list[str] = []
+    if backend_name == "pullpush":
+        backend = PullPushBackend()
+        raw: list[dict] = []
+        stats = {"scanned": 0, "oldest": None}
+        for sub in subs:
+            batch = backend.search_posts(query, sub, 100, after_utc)
+            _consume(batch, stats)
+            raw.extend(batch)
+        return GatherResult("pullpush", raw, stats["scanned"], stats["oldest"], False, notes)
+
+    backend = ArcticShiftBackend()
+    server_query = (query or "").strip()
+    terms = query_terms(server_query)
+    stats = {"scanned": 0, "oldest": None}
+
+    def browse_filtered() -> tuple[list[dict], bool]:
+        rows: list[dict] = []
+        trunc = False
+        for sub in subs:
+            batch, sub_trunc = backend.search_window("", sub, after_utc)
+            trunc = trunc or sub_trunc
+            _consume(batch, stats)
+            if terms:
+                batch = [row for row in batch if matches_terms(row, terms)]
+            rows.extend(batch)
+        return rows, trunc
+
+    if not terms:
+        rows, trunc = browse_filtered()
+        return GatherResult(backend.name, rows, stats["scanned"], stats["oldest"], trunc, notes)
+
     try:
-        dt = datetime.datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
-        return dt.timestamp()
-    except ValueError:
-        raise ValueError(f"bad --since value: {s!r} (use 24h, 7d, 30d or YYYY-MM-DD)")
+        rows = []
+        trunc = False
+        for sub in subs:
+            batch, sub_trunc = backend.search_window(server_query, sub, after_utc)
+            trunc = trunc or sub_trunc
+            _consume(batch, stats)
+            rows.extend(batch)
+    except BackendError as exc:
+        notes.append(
+            f"<!-- note: full-text search failed ({exc}); used browse+filter once -->"
+        )
+        stats["scanned"] = 0
+        stats["oldest"] = None
+        rows, trunc = browse_filtered()
+        return GatherResult(backend.name, rows, stats["scanned"], stats["oldest"], trunc, notes)
+
+    if not rows:
+        notes.append("<!-- note: full-text query returned 0; used browse+filter once -->")
+        stats["scanned"] = 0
+        stats["oldest"] = None
+        rows, trunc = browse_filtered()
+    return GatherResult(backend.name, rows, stats["scanned"], stats["oldest"], trunc, notes)
+
+
+def prepare_posts(
+    raw_posts: list[dict],
+    *,
+    now_ts: float,
+    excerpt_chars: int,
+    min_score: int,
+    limit: int,
+    engagement: bool,
+    engagement_top: int,
+    counter=None,
+    cache: EngagementCache | None = None,
+) -> tuple[list[dict], dict]:
+    info = {
+        "measured": 0,
+        "failed": 0,
+        "candidates": 0,
+        "cache_hits": 0,
+        "pending": 0,
+        "min_score_kept_pending": 0,
+    }
+    normed: list[dict] = []
+    for raw in raw_posts:
+        post = normalize_post(raw, excerpt_chars, now_ts)
+        if post is not None:
+            normed.append(post)
+    normed = dedup(normed)
+    if min_score > 0:
+        kept: list[dict] = []
+        for post in normed:
+            if post["score"] >= min_score:
+                kept.append(post)
+                continue
+            if post["score_status"] == "pending":
+                # The stored score is the creation snapshot, almost always 1.
+                # Honoring --min-score here would hide the entire recent window.
+                kept.append(post)
+                info["min_score_kept_pending"] += 1
+                continue
+        normed = kept
+    info["pending"] = sum(1 for post in normed if post.get("score_status") == "pending")
+    if engagement and normed:
+        if counter is None:
+            counter = ArcticShiftBackend().count_comments
+        if cache is None:
+            cache = EngagementCache(default_cache_path(), now_ts)
+        hits_before = cache.hits
+        candidates = select_engagement_candidates(normed, now_ts, engagement_top)
+        info["candidates"] = len(candidates)
+        measured, failed = measure_engagement(normed, candidates, counter, cache, now_ts)
+        info["measured"] = measured
+        info["failed"] = failed
+        info["cache_hits"] = cache.hits - hits_before
+    ranked = rank_posts(normed, now_ts, engagement=engagement)
+    if limit < 0:
+        limit = 0
+    return ranked[:limit], info
 
 
 # --------------------------------------------------------------------------
-# Renderers
+# Render
 # --------------------------------------------------------------------------
 
-def render_table(posts: list[dict]) -> str:
-    lines = ["| # | Title | Sub | 👍 | 💬 | Time |",
-             "|---|-------|-----|----|----|------|"]
-    for i, p in enumerate(posts, 1):
-        title = p["title"].replace("|", "\\|")
-        if len(title) > 90:
-            title = title[:87] + "…"
-        lines.append(f"| {i} | {title} | r/{p['subreddit']} | {p['score']} | {p['num_comments']} | {p['created'][:10]} |")
-        if p["excerpt"]:
-            lines.append(f"|   | ↳ {p['excerpt'][:200].replace('|', chr(92)+'|')} |||||")
-        lines.append(f"|   | ↳ {p['url']} |||||")
+def _cell(text: str) -> str:
+    return (text or "").replace("|", "\\|")
+
+
+def score_cell(post: dict) -> str:
+    if post.get("score_status") == "pending":
+        return "pending"
+    return str(post.get("score", 0))
+
+
+def comments_cell(post: dict) -> str:
+    if post.get("comments_source") == "live":
+        text = str(post.get("num_comments", 0))
+        if post.get("comments_capped"):
+            return text + "+"
+        return text
+    if post.get("score_status") == "pending":
+        # Archive num_comments is the creation snapshot. Don't print a bare 0.
+        archive = safe_int(post.get("num_comments"), 0)
+        if archive > 0:
+            return f"{archive}?"
+        return "?"
+    return str(post.get("num_comments", 0))
+
+
+def title_cell(post: dict) -> str:
+    title = post.get("title") or ""
+    if post.get("removed"):
+        title = f"{title} [removed]"
+    title = _cell(title)
+    if len(title) > 90:
+        title = title[:87] + "..."
+    return title
+
+
+def render_table(posts: list[dict], *, engagement: bool) -> str:
+    if engagement:
+        lines = [
+            "| # | Title | Sub | Score | Comments | /h | Time |",
+            "|---|-------|-----|-------|----------|----|------|",
+        ]
+    else:
+        lines = [
+            "| # | Title | Sub | Score | Comments | Time |",
+            "|---|-------|-----|-------|----------|------|",
+        ]
+    for index, post in enumerate(posts, 1):
+        sub = post.get("subreddit") or "?"
+        created = (post.get("created") or "")[:10]
+        if engagement:
+            cph = post.get("comments_per_hour")
+            cph_cell = f"{cph:.1f}" if isinstance(cph, (int, float)) else "-"
+            lines.append(
+                f"| {index} | {title_cell(post)} | r/{sub} | {score_cell(post)} | "
+                f"{comments_cell(post)} | {cph_cell} | {created} |"
+            )
+        else:
+            lines.append(
+                f"| {index} | {title_cell(post)} | r/{sub} | {score_cell(post)} | "
+                f"{comments_cell(post)} | {created} |"
+            )
+        excerpt = post.get("excerpt") or ""
+        if excerpt:
+            lines.append(f"|   | > {_cell(excerpt)} | | | | |")
+        url = post.get("url") or ""
+        if url:
+            lines.append(f"|   | {url} | | | | |")
     return "\n".join(lines)
 
 
 def render_comments(comments: list[dict]) -> str:
-    lines = []
-    for i, c in enumerate(comments, 1):
-        lines.append(f"**{i}. u/{c['author']}** (👍{c['score']}, {c['created'][:10]})")
-        lines.append(f"> {c['body']}")
+    lines: list[str] = []
+    for index, comment in enumerate(comments, 1):
+        created = (comment.get("created") or "")[:10]
+        lines.append(
+            f"**{index}. u/{comment['author']}** (score {comment['score']}, {created})"
+        )
+        lines.append(f"> {comment['body']}")
         lines.append("")
     return "\n".join(lines).rstrip()
 
 
-def render_digest(query: str, posts: list[dict], since: str) -> str:
-    total_comments = sum(p["num_comments"] for p in posts)
-    subs = sorted({p["subreddit"] for p in posts if p["subreddit"]})
-    lines = [f"# Reddit digest: \"{query}\" (since {since})",
-             f"- Posts: {len(posts)} | Comments: {total_comments} | Subs: {', '.join('r/'+s for s in subs)}",
-             "", "## Top discussions (agent: summarize into 3 themes + 1-line sentiment)"]
-    for i, p in enumerate(posts, 1):
-        lines.append(f"{i}. **{p['title']}** — r/{p['subreddit']}, 👍{p['score']}, 💬{p['num_comments']}, {p['created']}")
-        if p["excerpt"]:
-            lines.append(f"   > {p['excerpt']}")
-        lines.append(f"   {p['url']}")
+def render_digest(query: str, posts: list[dict], since: str, subs: list[str]) -> str:
+    where = ", ".join("r/" + name for name in subs)
+    if not posts:
+        return f'_no posts found in {where} since {since}_'
+    total_comments = sum(safe_int(post.get("num_comments"), 0) for post in posts)
+    sub_names = sorted({post["subreddit"] for post in posts if post.get("subreddit")})
+    lines = [
+        f'# Reddit digest: "{query}" (since {since})',
+        (
+            f"- Posts: {len(posts)} | Comments: {total_comments} | "
+            f"Subs: {', '.join('r/' + name for name in sub_names)}"
+        ),
+        "",
+        "## Top discussions (agent: summarize into 3 themes + 1-line sentiment)",
+    ]
+    for index, post in enumerate(posts, 1):
+        if post.get("score_status") == "pending":
+            score = "score pending"
+        else:
+            score = f"score {post['score']}"
+        extra = ""
+        cph = post.get("comments_per_hour")
+        if isinstance(cph, (int, float)):
+            extra = f", {cph:.1f}/h"
+        removed = " [removed]" if post.get("removed") else ""
+        sub = post.get("subreddit") or "?"
+        lines.append(
+            f"{index}. **{post['title']}{removed}** - r/{sub}, {score}, "
+            f"comments {comments_cell(post)}{extra}, {post.get('created') or ''}"
+        )
+        if post.get("excerpt"):
+            lines.append(f"   > {post['excerpt']}")
+        if post.get("url"):
+            lines.append(f"   {post['url']}")
     return "\n".join(lines)
+
+
+def meta_line(result: GatherResult, returned: int) -> str:
+    oldest = _iso(result.oldest) if result.oldest is not None else "-"
+    truncated = "yes" if result.truncated else "no"
+    return (
+        f"<!-- backend: {result.backend} | scanned: {result.scanned} | "
+        f"posts: {returned} | oldest: {oldest} | truncated: {truncated} -->"
+    )
 
 
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
-def cmd_search(a) -> int:
+def parse_since(text: str, now_ts: float) -> float:
+    token = text.strip().lower()
+    match = re.fullmatch(r"(\d+)\s*h", token)
+    if match:
+        return now_ts - int(match.group(1)) * 3600
+    match = re.fullmatch(r"(\d+)\s*d", token)
+    if match:
+        return now_ts - int(match.group(1)) * 86400
+    try:
+        day = datetime.datetime.strptime(token, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        raise ValueError(
+            f"error: bad --since value: {text!r} (use 24h, 7d, 30d or YYYY-MM-DD)"
+        ) from None
+    return day.timestamp()
+
+
+def parse_subs(raw: str | None) -> list[str]:
+    if raw is None or not str(raw).strip():
+        raise ValueError(SUBS_ERROR)
+    seen: set[str] = set()
+    names: list[str] = []
+    for token in str(raw).split(","):
+        name = token.strip()
+        lower = name.lower()
+        if lower.startswith("/r/"):
+            name = name[3:]
+        elif lower.startswith("r/"):
+            name = name[2:]
+        name = name.strip()
+        key = name.lower()
+        if not name or key in {"all", "*", "popular"}:
+            raise ValueError(SUBS_ERROR)
+        if not re.fullmatch(r"[A-Za-z0-9_]{2,30}", name):
+            raise ValueError(
+                f"error: bad subreddit name: {name!r} (use names like stocks, wallstreetbets)"
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    if not names:
+        raise ValueError(SUBS_ERROR)
+    return names
+
+
+def _positive(name: str, value: int) -> None:
+    if value < 1:
+        raise ValueError(f"error: {name} must be >= 1")
+
+
+def cmd_posts(args, *, digest: bool) -> int:
     now_ts = time.time()
     try:
-        after_utc = parse_since(a.since, now_ts)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
+        after_utc = parse_since(args.since, now_ts)
+        subs = parse_subs(args.subs)
+        _positive("--limit", args.limit)
+        _positive("--excerpt-chars", args.excerpt_chars)
+        engagement = bool(getattr(args, "engagement", False))
+        engagement_top = int(getattr(args, "engagement_top", ENGAGEMENT_TOP_DEFAULT))
+        capped_note = ""
+        if engagement:
+            _positive("--engagement-top", engagement_top)
+            if engagement_top > ENGAGEMENT_TOP_MAX:
+                capped_note = (
+                    f"<!-- note: --engagement-top {engagement_top} "
+                    f"capped at {ENGAGEMENT_TOP_MAX} -->"
+                )
+                engagement_top = ENGAGEMENT_TOP_MAX
+        min_score = int(getattr(args, "min_score", 0) or 0)
+    except ValueError as exc:
+        message = str(exc)
+        if not message.startswith("error:"):
+            message = "error: " + message
+        write_err(message)
         return 1
-    subs = [s.strip() for s in a.subs.split(",") if s.strip()] or ["all"]
-
-    # fetch raw, normalize, filter, rank
-    def fetch_all(backend):
-        raw_posts = []
-        for sub in subs:
-            raw_posts.extend(backend.search_posts(a.query, sub, a.limit * 2, after_utc))
-        normed = [normalize_post(p, a.excerpt_chars) for p in raw_posts]
-        if a.min_score > 0:
-            normed = [p for p in normed if p["score"] >= a.min_score]
-        return rank_posts(dedup(normed), now_ts)[:a.limit]
-
-    def fetch_browse_fallback():
-        """Level 3: Arctic Shift browse + client-side filter. Always works."""
-        backend = ArcticShiftBackend()
-        raw_posts = []
-        for sub in subs:
-            raw_posts.extend(backend.browse_filter(a.query, sub, a.limit * 2, after_utc))
-        normed = [normalize_post(p, a.excerpt_chars) for p in raw_posts]
-        if a.min_score > 0:
-            normed = [p for p in normed if p["score"] >= a.min_score]
-        return backend, rank_posts(dedup(normed), now_ts)[:a.limit]
 
     try:
-        backend, posts = with_fallback(a.backend, fetch_all)
-    except BackendError as e:
-        if not a.query or a.backend not in ("auto", "arctic-shift"):
-            print(f"error: all backends failed: {e}", file=sys.stderr)
-            return 2
-        try:
-            backend, posts = fetch_browse_fallback()
-            print(f"<!-- note: full-text index unavailable, used browse+filter fallback -->",
-                  file=sys.stderr)
-        except BackendError as e2:
-            print(f"error: all backends failed: {e} | fallback: {e2}", file=sys.stderr)
-            return 2
-
-    # Empty-result fallback: backends succeeded but found nothing for the query.
-    # Browse+filter often rescues this (stale/partial archive indexes).
-    if not posts and a.query and a.backend in ("auto", "arctic-shift"):
-        try:
-            b2, more = fetch_browse_fallback()
-            if more:
-                backend, posts = b2, more
-                print("<!-- note: query returned 0, browse+filter fallback found results -->",
-                      file=sys.stderr)
-        except BackendError:
-            pass
-
-    if a.format == "json":
-        print(json.dumps({"backend": backend.name, "count": len(posts), "posts": posts},
-                         ensure_ascii=False, indent=1))
-    else:
-        print(f"<!-- backend: {backend.name} | posts: {len(posts)} -->")
-        print(render_table(posts) if posts else "_no posts found_")
-    return 0
-
-
-def cmd_comments(a) -> int:
-    def fetch_all(backend):
-        raw = backend.get_comments(a.post_id, a.top)
-        return [normalize_comment(c, a.max_chars) for c in raw][:a.top]
-
-    try:
-        backend, comments = with_fallback(a.backend, fetch_all)
-    except BackendError as e:
-        print(f"error: all backends failed: {e}", file=sys.stderr)
+        gathered = gather_posts(args.query, subs, after_utc, args.backend)
+    except BackendError as exc:
+        write_err(f"error: all backends failed: {exc}")
         return 2
 
-    if a.format == "json":
-        print(json.dumps({"backend": backend.name, "count": len(comments), "comments": comments},
-                         ensure_ascii=False, indent=1))
+    counter = None
+    cache = None
+    if engagement:
+        arctic = ArcticShiftBackend()
+        counter = arctic.count_comments
+        cache = EngagementCache(default_cache_path(), now_ts)
+    posts, info = prepare_posts(
+        gathered.raw,
+        now_ts=now_ts,
+        excerpt_chars=args.excerpt_chars,
+        min_score=min_score,
+        limit=args.limit,
+        engagement=engagement,
+        engagement_top=engagement_top,
+        counter=counter,
+        cache=cache,
+    )
+    for note in gathered.notes:
+        write_err(note)
+    if capped_note:
+        write_err(capped_note)
+    if info["min_score_kept_pending"]:
+        write_err(
+            "<!-- note: --min-score does not drop posts younger than 36h; "
+            "their archive score is not backfilled yet -->"
+        )
+    if gathered.truncated:
+        write_err(
+            "<!-- note: time window truncated at "
+            f"{MAX_WINDOW_POSTS} posts per subreddit; narrow --since -->"
+        )
+    if info["pending"] and not engagement:
+        write_err(
+            "<!-- note: posts younger than 36h are marked score pending "
+            "(Arctic Shift snapshots score at creation). "
+            "Use --engagement or `hot` for live comment counts. -->"
+        )
+    if engagement:
+        write_err(
+            f"<!-- note: engagement measured {info['measured']}/{info['candidates']} "
+            f"young posts (cache hits {info['cache_hits']}, failures {info['failed']}); "
+            "comments/hour uses a 15min age floor; 300+ comments is a lower bound -->"
+        )
+
+    if args.format == "json":
+        payload = {
+            "backend": gathered.backend,
+            "scanned": gathered.scanned,
+            "count": len(posts),
+            "truncated": gathered.truncated,
+            "oldest": _iso(gathered.oldest) if gathered.oldest is not None else "",
+            "posts": posts,
+        }
+        if digest:
+            payload["query"] = args.query
+        write_out(json.dumps(payload, ensure_ascii=False, indent=1))
+        return 0
+
+    write_out(meta_line(gathered, len(posts)))
+    if digest:
+        write_out(render_digest(args.query, posts, args.since, subs))
+    elif posts:
+        write_out(render_table(posts, engagement=engagement))
     else:
-        print(f"<!-- backend: {backend.name} | comments: {len(comments)} -->")
-        print(render_comments(comments) if comments else "_no comments found_")
+        where = ", ".join("r/" + name for name in subs)
+        write_out(f"_no posts found in {where} since {args.since}_")
     return 0
 
 
-def cmd_digest(a) -> int:
-    now_ts = time.time()
+def cmd_search(args) -> int:
+    return cmd_posts(args, digest=False)
+
+
+def cmd_digest(args) -> int:
+    return cmd_posts(args, digest=True)
+
+
+def cmd_hot(args) -> int:
+    # hot is search with live engagement. Force the flag even if argparse
+    # defaults ever disagree with this command.
+    args.engagement = True
+    return cmd_posts(args, digest=False)
+
+
+def cmd_comments(args) -> int:
     try:
-        after_utc = parse_since(a.since, now_ts)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
+        _positive("--top", args.top)
+        _positive("--max-chars", args.max_chars)
+    except ValueError as exc:
+        write_err(str(exc))
         return 1
-    subs = [s.strip() for s in a.subs.split(",") if s.strip()] or ["all"]
-
-    def fetch_all(backend):
-        raw_posts = []
-        for sub in subs:
-            raw_posts.extend(backend.search_posts(a.query, sub, a.limit * 2, after_utc))
-        normed = [normalize_post(p, 300) for p in raw_posts]
-        return rank_posts(dedup(normed), now_ts)[:a.limit]
-
-    def fetch_browse_fallback():
-        backend = ArcticShiftBackend()
-        raw_posts = []
-        for sub in subs:
-            raw_posts.extend(backend.browse_filter(a.query, sub, a.limit * 2, after_utc))
-        normed = [normalize_post(p, 300) for p in raw_posts]
-        return backend, rank_posts(dedup(normed), now_ts)[:a.limit]
-
+    post_id = (args.post_id or "").strip()
+    if not post_id:
+        write_err("error: post id is required")
+        return 1
     try:
-        backend, posts = with_fallback(a.backend, fetch_all)
-    except BackendError as e:
-        if a.backend not in ("auto", "arctic-shift"):
-            print(f"error: all backends failed: {e}", file=sys.stderr)
-            return 2
-        try:
-            backend, posts = fetch_browse_fallback()
-        except BackendError as e2:
-            print(f"error: all backends failed: {e} | fallback: {e2}", file=sys.stderr)
-            return 2
-
-    # Empty-result fallback (see cmd_search).
-    if not posts and a.query and a.backend in ("auto", "arctic-shift"):
-        try:
-            b2, more = fetch_browse_fallback()
-            if more:
-                backend, posts = b2, more
-        except BackendError:
-            pass
-
-    if a.format == "json":
-        print(json.dumps({"backend": backend.name, "query": a.query,
-                          "count": len(posts), "posts": posts},
-                         ensure_ascii=False, indent=1))
+        if args.backend == "pullpush":
+            backend = PullPushBackend()
+        else:
+            backend = ArcticShiftBackend()
+        raw = backend.get_comments(post_id, args.top)
+        comments = [normalize_comment(row, args.max_chars) for row in raw][: args.top]
+    except BackendError as exc:
+        write_err(f"error: all backends failed: {exc}")
+        return 2
+    if args.format == "json":
+        write_out(json.dumps(
+            {"backend": backend.name, "count": len(comments), "comments": comments},
+            ensure_ascii=False,
+            indent=1,
+        ))
     else:
-        print(render_digest(a.query, posts, a.since) if posts
-              else f"_no posts for \"{a.query}\" since {a.since}_")
+        write_out(f"<!-- backend: {backend.name} | comments: {len(comments)} -->")
+        write_out(render_comments(comments) if comments else "_no comments found_")
     return 0
 
 
@@ -484,52 +1525,102 @@ def cmd_digest(a) -> int:
 # CLI
 # --------------------------------------------------------------------------
 
+class IntelArgumentParser(argparse.ArgumentParser):
+    """Usage errors exit 1. Exit 2 is reserved for backend failure."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(1, f"error: {message}\n")
+
+
+def _add_window_flags(parser, *, since_default: str, engagement_top_default: int) -> None:
+    parser.add_argument(
+        "--subs",
+        default=None,
+        help="comma-separated subreddits, required (example: stocks,investing). 'all' is rejected",
+    )
+    parser.add_argument(
+        "--since",
+        default=since_default,
+        help=f"time window: 24h, 7d, 30d, or YYYY-MM-DD UTC (default: {since_default})",
+    )
+    parser.add_argument("--limit", type=int, default=10, help="max posts to return (default: 10)")
+    parser.add_argument(
+        "--excerpt-chars",
+        type=int,
+        default=200,
+        help="excerpt length (default: 200)",
+    )
+    parser.add_argument("--format", choices=["compact", "json"], default="compact")
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "arctic-shift", "pullpush"],
+        default="auto",
+        help="auto is Arctic Shift only; pullpush is explicit opt-in and currently blocks agents",
+    )
+    parser.add_argument(
+        "--engagement",
+        action="store_true",
+        help="for posts younger than 36h, count live comments and rank those by comments/hour",
+    )
+    parser.add_argument(
+        "--engagement-top",
+        type=int,
+        default=engagement_top_default,
+        help=(
+            f"how many young posts to measure (1-{ENGAGEMENT_TOP_MAX}, "
+            f"default {engagement_top_default})"
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    parser = IntelArgumentParser(
         prog="reddit-intel",
-        description="Token-efficient Reddit intelligence CLI for LLM agents. "
-                    "Free data via Arctic Shift / PullPush archives, no API key needed.")
-    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+        description=(
+            "Token-efficient Reddit intelligence CLI for LLM agents. "
+            "Free data via the Arctic Shift archive, no API key needed. "
+            "--subs is required."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    def common(sp):
-        sp.add_argument("--subs", default="all",
-                        help="comma-separated subreddits (default: all)")
-        sp.add_argument("--since", default="7d",
-                        help="time window: 24h, 7d, 30d or YYYY-MM-DD (default: 7d)")
-        sp.add_argument("--limit", type=int, default=10,
-                        help="max posts to return (default: 10)")
-        sp.add_argument("--format", choices=["compact", "json"], default="compact",
-                        help="output format (default: compact)")
-        sp.add_argument("--backend", choices=["auto", "arctic-shift", "pullpush"],
-                        default="auto", help="data backend (default: auto with fallback)")
+    search = sub.add_parser("search", help="search posts in a real --since window")
+    search.add_argument("query", help="full-text query; empty string browses the window")
+    search.add_argument("--min-score", type=int, default=0, help="minimum backfilled score")
+    _add_window_flags(search, since_default="7d", engagement_top_default=ENGAGEMENT_TOP_DEFAULT)
+    search.set_defaults(func=cmd_search, engagement=False)
 
-    s = sub.add_parser("search", help="search posts (compact table by default)")
-    s.add_argument("query", help="full-text query (empty string = browse latest)")
-    s.add_argument("--min-score", type=int, default=0, help="minimum post score")
-    s.add_argument("--excerpt-chars", type=int, default=200, help="excerpt length")
-    common(s)
-    s.set_defaults(func=cmd_search)
+    hot = sub.add_parser("hot", help="rank recent posts by live comments/hour")
+    hot.add_argument("query", nargs="?", default="", help="optional keyword filter")
+    hot.add_argument("--min-score", type=int, default=0, help="minimum backfilled score")
+    _add_window_flags(hot, since_default="36h", engagement_top_default=10)
+    hot.set_defaults(func=cmd_hot, engagement=True)
 
-    c = sub.add_parser("comments", help="top comments of a post")
-    c.add_argument("post_id", help="post id (with or without t3_ prefix)")
-    c.add_argument("--top", type=int, default=20, help="max comments (default: 20)")
-    c.add_argument("--max-chars", type=int, default=300, help="body truncate length")
-    c.add_argument("--format", choices=["compact", "json"], default="compact")
-    c.add_argument("--backend", choices=["auto", "arctic-shift", "pullpush"], default="auto")
-    c.set_defaults(func=cmd_comments)
+    comments = sub.add_parser("comments", help="top comments of a post")
+    comments.add_argument("post_id", help="post id, with or without the t3_ prefix")
+    comments.add_argument("--top", type=int, default=20, help="max comments (default: 20)")
+    comments.add_argument("--max-chars", type=int, default=300, help="body truncate length")
+    comments.add_argument("--format", choices=["compact", "json"], default="compact")
+    comments.add_argument(
+        "--backend",
+        choices=["auto", "arctic-shift", "pullpush"],
+        default="auto",
+    )
+    comments.set_defaults(func=cmd_comments)
 
-    d = sub.add_parser("digest", help="agent briefing prep: ranked posts for a topic window")
-    d.add_argument("query", help="topic query")
-    common(d)
-    d.set_defaults(func=cmd_digest)
-
-    return p
+    digest = sub.add_parser("digest", help="briefing prep: ranked posts for a topic window")
+    digest.add_argument("query", help="topic query")
+    _add_window_flags(digest, since_default="7d", engagement_top_default=ENGAGEMENT_TOP_DEFAULT)
+    digest.set_defaults(func=cmd_digest, engagement=False)
+    return parser
 
 
 def main(argv=None) -> int:
+    configure_stdio()
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
